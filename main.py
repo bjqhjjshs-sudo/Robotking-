@@ -1,3 +1,4 @@
+
 """
 ALPHABOT FUTURES v5.3 -- EXIT ENGINE + BE ADAPTATIF
 Full Auto | Binance USDT-M Futures | Capital micro (<$50)
@@ -2578,4 +2579,3 @@ if __name__ == "__main__":
     finally:
         if _flask_ok:
             _bot_status["running"] = False
-
