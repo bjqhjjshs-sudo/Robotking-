@@ -1513,12 +1513,33 @@ def open_trade(symbol: str, sig: dict, ss: "SessionState",
         set_leverage_api(symbol, eff_lev)
     time.sleep(0.5)   # <- laisser Binance appliquer le levier avant l'ordre
 
-    # ── Entree MARKET ─────────────────────────────────────────
+    # ── Entree MARKET avec retry lot ─────────────────────────
     qty_str   = fmt_qty(qty, info["stepSize"])
-    entry_ord = place_order(symbol, entry_side, "MARKET", qty_str)
+    entry_ord = None
+    _qty_attempt = qty
+
+    for _attempt in range(3):
+        _qty_str_try = fmt_qty(_qty_attempt, info["stepSize"])
+        entry_ord = place_order(symbol, entry_side, "MARKET", _qty_str_try)
+        if entry_ord and entry_ord.get("status") in ("FILLED", "NEW", "PARTIALLY_FILLED"):
+            qty     = _qty_attempt
+            qty_str = _qty_str_try
+            if _attempt > 0:
+                log(f"  {symbol}: lot ajuste -> {qty_str} ([OK] après {_attempt+1} essais)", "WARN")
+            break
+        err_msg = entry_ord.get("msg", "") if entry_ord else "timeout"
+        log(f"  {symbol}: ordre entree refusé (essai {_attempt+1}/3) -> {err_msg}", "WARN")
+        # Binance erreur -1111 (lot invalide) ou -2019 (marge insuffisante) :
+        # on réduit la qty de 20% et on réessaie
+        _qty_attempt = round_step(_qty_attempt * 0.80, info["stepSize"])
+        if _qty_attempt < info["minQty"]:
+            log(f"  {symbol}: qty {_qty_attempt} < minQty après réduction -> abandon", "WARN")
+            break
+        time.sleep(0.5)
+
     if not entry_ord or entry_ord.get("status") not in (
             "FILLED", "NEW", "PARTIALLY_FILLED"):
-        log(f"  {symbol}: ordre entree echoue -> {entry_ord}", "ERROR")
+        log(f"  {symbol}: ordre entree echoue apres 3 essais -> {entry_ord}", "ERROR")
         return None
 
     real_entry = float(entry_ord.get("avgPrice") or entry_ord.get("price") or entry)
@@ -1553,17 +1574,37 @@ def open_trade(symbol: str, sig: dict, ss: "SessionState",
         cancel_all_orders(symbol)
         return None
 
-    # ── SL : STOP_MARKET ──────────────────────────────────────
-    sl_ord = place_order(
-        symbol, close_side, "STOP_MARKET", qty_str,
-        stop_price=fmt_px(sl_final, info["tickSize"]),
-        reduce_only=True,
-    )
-    if not sl_ord:
-        log(f"  {symbol}: SL non pose -- SURVEILLANCE MANUELLE", "WARN")
-        tg_send(f"⚠️ <b>{symbol}</b> : SL Binance non pose ! Surveillance manuelle !")
+    # ── SL : STOP_MARKET avec retry ──────────────────────────
+    sl_ord        = None
+    sl_order_id   = None
+    sl_binance_ok = False
 
-    sl_order_id = sl_ord.get("orderId") if sl_ord else None   # [P1-G] pour break-even
+    for _sl_try in range(3):
+        sl_ord = place_order(
+            symbol, close_side, "STOP_MARKET", qty_str,
+            stop_price=fmt_px(sl_final, info["tickSize"]),
+            reduce_only=True,
+        )
+        if sl_ord and sl_ord.get("orderId"):
+            sl_binance_ok = True
+            sl_order_id   = sl_ord.get("orderId")
+            break
+        log(f"  {symbol}: SL Binance echec essai {_sl_try+1}/3 -> retry...", "WARN")
+        time.sleep(0.8)
+
+    if not sl_binance_ok:
+        # SL non posé sur Binance : on active le watchdog Python-side
+        # Le moniteur surveillera le prix et clôturera en MARKET si SL atteint
+        log(
+            f"  {symbol}: ⚠️ SL Binance non posé après 3 essais -- "
+            f"WATCHDOG PYTHON activé @ {sl_final:.6f}",
+            "WARN",
+        )
+        tg_send(
+            f"⚠️ <b>{symbol}</b> : SL Binance refusé !\n"
+            f"🛡️ <b>Watchdog Python activé</b> @ <code>{sl_final:.6f}</code>\n"
+            f"Le bot clôturera en MARKET si le prix atteint ce niveau."
+        )
 
     # ── 🔧 BUG #2 FIX : TP qty avec remaining correct ─────────
     tp_records = []
@@ -1588,21 +1629,40 @@ def open_trade(symbol: str, sig: dict, ss: "SessionState",
             part_qty  = max(remaining, info["minQty"])
             remaining = 0.0
 
-        tp_ord = place_order(
-            symbol, close_side, "TAKE_PROFIT_MARKET",
-            fmt_qty(part_qty, info["stepSize"]),
-            stop_price=tp_px_str, reduce_only=True,
-        )
-        if not tp_ord:
-            log(f"  {symbol}: TP{i+1} non pose", "WARN")
+        # ── TP avec retry + watchdog Python si Binance refuse ─
+        tp_ord        = None
+        tp_binance_ok = False
+        for _tp_try in range(3):
+            tp_ord = place_order(
+                symbol, close_side, "TAKE_PROFIT_MARKET",
+                fmt_qty(part_qty, info["stepSize"]),
+                stop_price=tp_px_str, reduce_only=True,
+            )
+            if tp_ord and tp_ord.get("orderId"):
+                tp_binance_ok = True
+                break
+            log(f"  {symbol}: TP{i+1} Binance echec essai {_tp_try+1}/3 -> retry...", "WARN")
+            time.sleep(0.6)
+
+        if not tp_binance_ok:
+            log(
+                f"  {symbol}: ⚠️ TP{i+1} Binance non posé -- watchdog Python @ {tp_px_str}",
+                "WARN",
+            )
+            tg_send(
+                f"⚠️ <b>{symbol}</b> : TP{i+1} Binance refusé !\n"
+                f"🛡️ <b>Watchdog Python activé</b> @ <code>{tp_px_str}</code>\n"
+                f"Le bot clôturera partiellement en MARKET si le prix atteint ce niveau."
+            )
 
         tp_records.append({
-            "r"       : tp_def["r"],
-            "pct"     : tp_def["pct"],
-            "price"   : float(tp_px_str),
-            "qty"     : part_qty,
-            "hit"     : False,
-            "order_id": tp_ord.get("orderId") if tp_ord else None,
+            "r"            : tp_def["r"],
+            "pct"          : tp_def["pct"],
+            "price"        : float(tp_px_str),
+            "qty"          : part_qty,
+            "hit"          : False,
+            "order_id"     : tp_ord.get("orderId") if tp_ord else None,
+            "binance_ok"   : tp_binance_ok,   # False = watchdog Python actif
         })
 
     # ── Build trade object ────────────────────────────────────
@@ -1617,6 +1677,7 @@ def open_trade(symbol: str, sig: dict, ss: "SessionState",
         "sl"            : sl_final,
         "sl_source"     : sl_source,
         "sl_order_id"   : sl_order_id,    # [P1-G] break-even
+        "sl_binance_ok" : sl_binance_ok,  # [v5.3.3] False = watchdog Python actif
         "be_triggered"  : False,           # [P1-G] flag break-even
         "closing"       : False,           # [v5.3] anti race-condition
         "close_reason"  : None,            # [v5.3] close_reason structure
@@ -1995,6 +2056,39 @@ class LivePositionManager:
             if closed:
                 return True   # sera retire de positions dans monitor_all
 
+        # ── 1b. Watchdog TP Python (si Binance a refusé le TP) ──
+        # Pour chaque TP dont binance_ok=False, on surveille le prix
+        # et on clôture en MARKET si atteint
+        if CLOSE_MODE != "BINANCE_ONLY":
+            for _tp in trade.get("tps", []):
+                if _tp.get("hit"):        continue
+                if _tp.get("binance_ok", True): continue  # Binance gère
+                tp_price = _tp["price"]
+                tp_hit = (
+                    (direction == "LONG"  and mark >= tp_price) or
+                    (direction == "SHORT" and mark <= tp_price)
+                )
+                if tp_hit:
+                    _tp_label = f"R{_tp['r']}"
+                    log(
+                        f"  [WATCHDOG_TP] {sym}: mark {mark:.6f} atteint TP "
+                        f"{tp_price:.6f} ({_tp_label}) -> clôture Python",
+                        "TRADE",
+                    )
+                    _tp["hit"] = True
+                    ok = self._close_partial(
+                        sym, trade,
+                        pct=_tp["pct"],
+                        reason=f"WATCHDOG_TP_{_tp_label}",
+                    )
+                    if ok:
+                        tg_send(
+                            f"🎯 <b>Watchdog TP {_tp_label} -- {sym}</b>\n"
+                            f"Mark  : <code>{mark:.6f}</code>\n"
+                            f"TP    : <code>{tp_price:.6f}</code>\n"
+                            f"Qty   : {_tp['pct']*100:.0f}%  [{direction}]"
+                        )
+
         # ── 2. Partial close à 2R ─────────────────────────────
         if PARTIAL_CLOSE_R2 and risk_dist > 0 and CLOSE_MODE != "BINANCE_ONLY":
             r2_price = (entry + risk_dist * 2.0 if direction == "LONG"
@@ -2324,9 +2418,10 @@ def print_dashboard(pm: LivePositionManager, ss: SessionState, cycle: int):
 def main():
     print(cyn(bld("""
 ╔═══════════════════════════════════════════════════════════════╗
-║   ALPHABOT FUTURES v5.0 — QUALITÉ D'ENTRÉE + HTF BIAS       ║
-║   21 marchés | HTF M15 | BTC corr | Session | BE auto       ║
+║   ALPHABOT FUTURES v5.3.3 -- EXIT ENGINE + BE ADAPTATIF     ║
+║   21 marches | HTF M15 | BTC corr | Session | BE auto       ║
 ╚═══════════════════════════════════════════════════════════════╝""")))
+    log("🚀 main() démarré -- initialisation en cours...", "INFO")
 
     if not API_KEY or "COLLE" in (API_KEY or ""):
         log("⛔ API_KEY non renseignee.", "ERROR")
@@ -2335,9 +2430,20 @@ def main():
         log("   export ANTHROPIC_API_KEY='ta_cle_anthropic'", "ERROR")
         return
 
+    # Anti-ban Binance : delais entre appels au demarrage
+    # Chaque restart trop rapide flood IP -> ban 418
+    log("Demarrage dans 5s (anti-ban Binance)...", "INFO")
+    time.sleep(5)
+
+    log("⏱️  Synchronisation horloge Binance...", "INFO")
     sync_server_time()
-    log("Chargement exchange info...", "INFO")
+    time.sleep(1)
+
+    log("📡 Chargement exchange info...", "INFO")
     if not load_symbol_info(): return
+    time.sleep(2)
+
+    log("💰 Récupération balance USDT...", "INFO")
 
     balance = get_balance_usdt()
     if balance <= 0:
@@ -2565,16 +2671,22 @@ if __name__ == "__main__":
         t.start()
         _bot_status["started_at"] = datetime.now().isoformat()
         _bot_status["running"]    = True
+        # ── FIX RENDER : laisser Flask binder le port et passer le health-check
+        # avant de lancer main() qui fait des appels réseau longs (Binance, Anthropic).
+        # Sans ce sleep, Render peut redéployer si le GET / n'arrive pas assez vite.
+        log("⏳ Attente 5s -- Flask health-check Render...", "INFO")
+        time.sleep(5)
     else:
         log("Flask non installe -- mode standalone", "WARN")
 
     try:
+        log("🚀 main() démarré", "INFO")
         main()
     except KeyboardInterrupt:
         print(grn(bld("\n  ✋ Bot arrête manuellement.")))
     except Exception as e:
         log(f"ERREUR CRITIQUE: {e}", "ERROR")
-        tg_send(f"🚨 <b>AlphaBot v5.0 CRASH</b>\n{e}")
+        tg_send(f"🚨 <b>AlphaBot v5.3 CRASH</b>\n{e}")
         raise
     finally:
         if _flask_ok:
