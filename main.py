@@ -793,6 +793,50 @@ def _request(method: str, path: str,
 
     except urlerr.HTTPError as e:
         body = e.read().decode()
+        # ── 418 : IP bannie par Binance ───────────────────────
+        if e.code == 418:
+            # Extraire la durée du ban si disponible dans le message
+            wait_sec = 90  # attente minimale prudente
+            try:
+                banned_data = json.loads(body)
+                banned_msg  = banned_data.get("msg", "")
+                # Format : "banned until <timestamp_ms>"
+                if "banned until" in banned_msg:
+                    ban_ts_ms  = int(banned_msg.split("banned until")[1].strip().split(".")[0])
+                    wait_sec   = max(90, (ban_ts_ms - int(time.time() * 1000)) // 1000 + 5)
+                    wait_min   = round(wait_sec / 60, 1)
+                    log(
+                        f"🚫 IP BANNIE Binance (418) -- ban jusqu'à {ban_ts_ms}ms "
+                        f"-- attente {wait_min}min",
+                        "ERROR",
+                    )
+                    tg_send(
+                        f"🚫 <b>IP Bannie Binance !</b>\n"
+                        f"Durée : <code>{wait_min} min</code>\n"
+                        f"Bot en pause automatique -- reprise dans {wait_min}min."
+                    )
+                    # On attend par tranches de 30s pour rester réactif
+                    slept = 0
+                    while slept < wait_sec:
+                        chunk = min(30, wait_sec - slept)
+                        time.sleep(chunk)
+                        slept += chunk
+                        remaining = round((wait_sec - slept) / 60, 1)
+                        if remaining > 0:
+                            log(f"  🚫 Ban Binance -- encore {remaining}min...", "WARN")
+                else:
+                    log(f"🚫 IP Bannie Binance (418) -- attente {wait_sec}s", "ERROR")
+                    tg_send(f"🚫 <b>IP Bannie Binance (418)</b> -- attente {wait_sec}s")
+                    time.sleep(wait_sec)
+            except Exception:
+                log(f"🚫 IP Bannie Binance (418) -- attente {wait_sec}s", "ERROR")
+                time.sleep(wait_sec)
+            return None
+        # ── 429 : rate limit (pas encore banni) ──────────────
+        elif e.code == 429:
+            log(f"⚠️ Rate limit Binance (429) -- attente 10s", "WARN")
+            time.sleep(10)
+            return None
         log(f"API {method} {path} -> HTTP {e.code}: {body}", "ERROR")
         return None
     except Exception as e:
@@ -810,11 +854,16 @@ def get_mark_price(symbol: str) -> Optional[dict]:
     return _request("GET", "/fapi/v1/markPrice", {"symbol": symbol})
 
 def get_balance_usdt() -> float:
-    resp = _request("GET", "/fapi/v2/balance", {}, signed=True)
-    if not isinstance(resp, list): return 0.0
-    for a in resp:
-        if a.get("asset") == "USDT":
-            return float(a.get("availableBalance", 0))
+    for _attempt in range(3):
+        resp = _request("GET", "/fapi/v2/balance", {}, signed=True)
+        if isinstance(resp, list):
+            for a in resp:
+                if a.get("asset") == "USDT":
+                    return float(a.get("availableBalance", 0))
+            return 0.0
+        if _attempt < 2:
+            log(f"Balance indisponible (essai {_attempt+1}/3) -- retry 5s...", "WARN")
+            time.sleep(5)
     return 0.0
 
 def get_open_positions() -> List[dict]:
@@ -857,9 +906,14 @@ _sym_info: Dict[str, dict] = {}
 
 def load_symbol_info() -> bool:
     global _sym_info
-    info = get_exchange_info()
-    if not info or "symbols" not in info:
-        log("Impossible de charger exchangeInfo", "ERROR")
+    for _attempt in range(5):
+        info = get_exchange_info()
+        if info and "symbols" in info:
+            break
+        log(f"Impossible de charger exchangeInfo (essai {_attempt+1}/5) -- retry 30s...", "ERROR")
+        time.sleep(30)
+    else:
+        log("exchangeInfo toujours indisponible après 5 essais -- abandon", "ERROR")
         return False
     for s in info["symbols"]:
         sym = s["symbol"]
@@ -2418,7 +2472,7 @@ def print_dashboard(pm: LivePositionManager, ss: SessionState, cycle: int):
 def main():
     print(cyn(bld("""
 ╔═══════════════════════════════════════════════════════════════╗
-║   ALPHABOT FUTURES v5.3.3 -- EXIT ENGINE + BE ADAPTATIF     ║
+║   ALPHABOT FUTURES v5.3.4 -- ANTI-BAN + WATCHDOG            ║
 ║   21 marches | HTF M15 | BTC corr | Session | BE auto       ║
 ╚═══════════════════════════════════════════════════════════════╝""")))
     log("🚀 main() démarré -- initialisation en cours...", "INFO")
@@ -2432,8 +2486,8 @@ def main():
 
     # Anti-ban Binance : delais entre appels au demarrage
     # Chaque restart trop rapide flood IP -> ban 418
-    log("Demarrage dans 5s (anti-ban Binance)...", "INFO")
-    time.sleep(5)
+    log("Demarrage dans 30s (anti-ban Binance -- protection IP)...", "INFO")
+    time.sleep(30)
 
     log("⏱️  Synchronisation horloge Binance...", "INFO")
     sync_server_time()
