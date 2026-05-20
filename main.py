@@ -1,2747 +1,1950 @@
-
+#!/usr/bin/env python3
 """
-ALPHABOT FUTURES v5.3 -- EXIT ENGINE + BE ADAPTATIF
-Full Auto | Binance USDT-M Futures | Capital micro (<$50)
-21 marches scannes | Top N paires selectionnees par score
-SL structurel (SwingHL) | Agent IA Anthropic validateur
-Risk adaptatif | TP fractionne 50/30/20%
-Pure stdlib | Pydroid3 Android compatible
-
-HERITE v5.0 :
-  [1] BOS displacement filter : body >= 0.6xATR + close %
-      au-dela de la structure -> elimine les fake breakouts 1m
-  [2] HTF M15 bias : direction alignee avec structure M15
-  [3] Session filter dur : London + NY uniquement
-  [4] BTC correlation gate : altcoins bloques si BTC contra
-  [5] Volatility spike filter : bougie >= 3.5xATR -> skip
-  [6] Score rebalance : CRT +1, displacement +1, max 7
-  [7] Break-even automatique v5.0
-
-NOUVEAU v5.3 -- STRATEGIC EXIT ENGINE :
-
-  [E1] Break-even ADAPTATIF -- 3 modes :
-       * vol HIGH   -> trigger BE_FAST_R (0.3R) -- ultra-reactif
-       * vol NORMAL -> trigger BE_TRIGGER_R (0.5R) -- standard
-       * score=7 + HTF aligne -> buffer fees / BE_TIGHT_BUF_MULT
-         (BE plus serre, verrouille plus de profit sur setups elite)
-
-  [E2] SL Failover manuel (_close_at_sl)
-       Si Binance lag/echoue a declencher le SL : ordre MARKET
-       Python-side pour eviter les pertes ouvertes non protegees.
-
-  [E3] Partial close R2 (_close_partial)
-       Si mark atteint 2R et TP2 Binance non encore touche :
-       cloture manuelle 30% de la position en MARKET.
-       Active via PARTIAL_CLOSE_R2 = True.
-
-  [E4] Trailing stop ATR (_close_trail)
-       Active apres TRAIL_R_START x R (defaut : 2R).
-       SL = mark +/- ATR x TRAIL_ATR_MULT (mark-based, robuste
-       vs micro-spikes en futures, evite les faux stop-outs).
-       Ne recule jamais : le SL ne peut qu avancer.
-
-  [E5] Time exit (_close_time_exit)
-       Sortie forcee si trade ouvert > MAX_TRADE_HOURS (defaut: 6h).
-       Libere le capital immobilise par des positions zombies.
-
-  [E6] Anti race-condition systematique
-       trade["closing"] = True dans TOUS les moteurs de fermeture.
-       Bloque toute double execution (Binance TP + trailing + SL
-       en parallele) -> zero ordre double, zero position fantome.
-
-  [E7] close_reason structure (journal + banners console)
-       SL_HARD | SL_MANUAL | TP_PARTIAL | TRAIL_STOP |
-       TIME_EXIT | BE_EXIT | BINANCE_TP | BINANCE_CLOSED
-
-  [E8] CLOSE_MODE configurable
-       BINANCE_ONLY : 100% exchange orders (comportement v5.0)
-       STRATEGIC    : moteur Python complet (defaut v5.3)
-       HYBRID       : Binance prioritaire + fallback Python
+╔══════════════════════════════════════════════════════════════════════════╗
+║  ALPHABOT PRO — MAIN ORCHESTRATOR  v2.0                                 ║
+║                                                                          ║
+║  Pipeline complet :                                                      ║
+║    Market Data → HTF Bias → AMD Filter → FVG/OB → Session Filter       ║
+║    → News Filter → Spread Filter → Module M → Module H                  ║
+║    → Effective RR → Correlation Exposure → Telegram Delivery            ║
+║                                                                          ║
+║  Hardening intégré :                                                    ║
+║    ✅ Cooldown par symbole (2h)                                          ║
+║    ✅ Anti-duplicate setup hash (6h TTL)                                 ║
+║    ✅ News hard filter — NO-TRADE zone dans ±20 min                     ║
+║    ✅ Spread live filter (ratio spread/ATR)                              ║
+║    ✅ Session quality score                                              ║
+║    ✅ Killzone engine (London 07-10 UTC / NY 12-15 UTC)                 ║
+║    ✅ Correlation / USD exposure cap                                     ║
+║    ✅ OHLC cache avec TTL par timeframe                                  ║
+║    ✅ RR calculé sur effective entry (ask/bid + spread)                  ║
+║    ✅ Render watchdog — exception isolation, jamais de crash silencieux  ║
+║                                                                          ║
+║  Variables d'environnement requises :                                   ║
+║    TELEGRAM_BOT_TOKEN   — token @BotFather                              ║
+║    TELEGRAM_CHAT_ID     — ID du canal/groupe                            ║
+║    ACCOUNT_BALANCE      — balance USD (ex. "2000")                      ║
+║                                                                          ║
+║  Dépendances :                                                           ║
+║    pip install yfinance python-dotenv requests                          ║
+╚══════════════════════════════════════════════════════════════════════════╝
 """
 
+from __future__ import annotations
 
-import os, json, csv, time, hmac, hashlib, math, copy
-from datetime import datetime
-from urllib import request as urlreq, parse as urlparse, error as urlerr
-from typing import Optional, Tuple, List, Dict
+import asyncio
+import datetime
+import hashlib
+import logging
+import os
+import time
+from typing import Dict, List, Optional, Tuple
 
-# ???????????????????????????????????????????????????????????????
-#  ?  CONFIGURATION
-# ???????????????????????????????????????????????????????????????
-API_KEY    = os.environ.get("BINANCE_KEY",    "UhM8iOqQvoWF6vVO16LqK88cebdS063DufgqsLs1hjq8Puj9kiF0WffgnM73B9pd")
-API_SECRET = os.environ.get("BINANCE_SECRET", "0ecLSeiUZLNLKFou8GCVY9VGJunpu2QBNlBOmV0Sr7MUA4Ye3tqpIDMoThjmiLP7")
-TG_TOKEN   = os.environ.get("TG_TOKEN",       "7403481925:AAEDticdpHEhdCrVbwmopMG7QIi31bWxrwA-Nw")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID",     "7403481925")
+import requests
+import yfinance as yf
+from dotenv import load_dotenv
 
-# ?? Anthropic AI Agent ????????????????????????????????????????
-ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "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")
-ANTHROPIC_MODEL    = "claude-sonnet-4-20250514"
-AI_MIN_CONFIDENCE  = 68   # score minimum IA pour autoriser le trade (0-100)
-AI_ENABLED         = True  # False = desactive l'agent (mode legacy)
+# ── Modules AlphaBot ──────────────────────────────────────────────────────
+from alphabot_survival_v4 import (
+    compute_position_size,
+    DailyRiskManager,
+    detect_market_structure,
+    detect_fvg,
+    detect_order_blocks,
+)
+from alphabot_module_m import compute_effective_sl, pipeline_sl_to_risk, fmt_sl_block
 
-# ═══════════════════════════════════════════════════════════════
-#  ⚙️  PARAMÈTRES DE TRADING
-# ═══════════════════════════════════════════════════════════════
-LEVERAGE          = 20
-MAX_MARGIN_PCT    = 0.15
-MIN_BALANCE_USD   = 1.0
+# ══════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════
 
-RISK_TIERS = [
-    (1.0,  1.5,  0.050),
-    (1.5,  2.0,  0.050),
-    (2.0,  3.0,  0.045),
-    (3.0,  5.0,  0.040),
-    (5.0,  999,  0.035),
-]
+load_dotenv()
 
-SIGNAL_RISK_SCALE = {
-    7: 0.080,
-    6: 0.065,
-    5: 0.050,
+BOT_TOKEN       = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID         = os.environ["TELEGRAM_CHAT_ID"]
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "2000"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("AlphaBotPRO")
+
+# ── Tickers yfinance ──────────────────────────────────────────────────────
+YF_TICKERS: Dict[str, str] = {
+    "XAUUSD": "GC=F",
+    "XAGUSD": "SI=F",
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDJPY": "JPY=X",
+    "AUDUSD": "AUDUSD=X",
+    "USDCHF": "CHF=X",
+    "USDCAD": "CAD=X",
+    "GBPJPY": "GBPJPY=X",
+    "NAS100": "NQ=F",
 }
-RISK_MAX_CAP = 0.08
-RISK_MIN_PCT = 0.05
 
-FEE_RATE          = 0.0004
-MAX_POSITIONS     = 3
-COOLDOWN_MIN      = 15
-SCAN_INTERVAL_SEC = 60
-KLINES_LIMIT      = 220
-TG_SUMMARY_CYCLES = 60
-MAX_CONSEC_SL     = 3
-PAUSE_AFTER_SL_MIN= 30
-PROFIT_LOCK_PCT   = 0.50
+# Crypto Binance — API publique (aucune clé requise)
+BINANCE_SYMBOLS: Dict[str, str] = {
+    "BTCUSDT": "BTCUSDT",
+    "ETHUSDT":  "ETHUSDT",
+}
 
-TP_SPLIT = [
-    {"r": 1.0, "pct": 0.50},
-    {"r": 2.0, "pct": 0.30},
-    {"r": 3.0, "pct": 0.20},
-]
+# ── Tiers de priorité ─────────────────────────────────────────────────────
+TIER_1 = ["XAUUSD", "BTCUSDT"]
+TIER_2 = ["XAGUSD", "ETHUSDT", "GBPJPY", "NAS100"]
+TIER_3 = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCHF", "USDCAD"]
+ALL_SYMBOLS = TIER_1 + TIER_2 + TIER_3
 
-SYMBOLS = [
-    "ETHUSDT",   "BNBUSDT",   "DOGEUSDT",  "SOLUSDT",   "XRPUSDT",
-    "APTUSDT",   "LINKUSDT",  "OPUSDT",    "AVAXUSDT",  "ADAUSDT",
-    "LTCUSDT",   "MATICUSDT", "UNIUSDT",   "AAVEUSDT",  "NEARUSDT",
-    "FTMUSDT",   "XLMUSDT",   "TRXUSDT",   "SANDUSDT",  "ALGOUSDT",
-    "ETCUSDT",
-]
-TOP_N_SYMBOLS = 8
+# ── Corrélation USD : groupes à exposure limitée ─────────────────────────
+# Chaque groupe = paires qui bougent ensemble quand USD se déplace
+USD_CORR_GROUPS: Dict[str, List[str]] = {
+    "USD_STRENGTH": ["EURUSD", "GBPUSD", "AUDUSD", "USDCHF", "USDCAD", "USDJPY"],
+    "RISK_ON":      ["XAUUSD", "XAGUSD", "NAS100", "BTCUSDT", "ETHUSDT"],
+    "GBP":          ["GBPUSD", "GBPJPY"],
+}
+MAX_CORR_EXPOSURE = 2   # max 2 positions simultanées dans le même groupe
 
-OB_LOOKBACK        = 5
-FIB_MIN            = 0.50
-FIB_MAX            = 0.90
-IMBALANCE_MIN_FILL = 0.65
-CRT_BODY_RATIO     = 0.55
-CRT_WICK_RATIO     = 0.60
-CRT_ENGULF_MULT    = 1.30
-CRT_TWEEZER_TOL    = 0.0015
-ATR_PERIOD         = 14
-ATR_LOW_MULT       = 0.003
-ATR_HIGH_MULT      = 0.018
-SL_ATR_MIN_FACTOR  = 1.5
-SCORE_THRESH       = {"LOW": 6, "NORMAL": 5, "HIGH": 5}
-SCORE_MAX          = 7
+# ── Spreads typiques en pips ──────────────────────────────────────────────
+SPREAD_PIPS: Dict[str, float] = {
+    "XAUUSD":  3.0,  "XAGUSD":  5.0,
+    "BTCUSDT": 20.0, "ETHUSDT": 5.0,
+    "EURUSD":  1.2,  "GBPUSD":  1.5,
+    "USDJPY":  1.0,  "AUDUSD":  1.5,
+    "USDCHF":  2.0,  "USDCAD":  2.0,
+    "GBPJPY":  2.5,  "NAS100":  4.0,
+}
 
-SNIPER_MODE         = True
-SNIPER_COOLDOWN_MIN = 60
-SNIPER_MIN_SCORE    = 6
+# Pip size par symbole (pour convertir spread pips → prix)
+PIP_SIZE: Dict[str, float] = {
+    "XAUUSD": 0.10,   "XAGUSD": 0.001,
+    "BTCUSDT": 1.0,   "ETHUSDT": 0.01,
+    "EURUSD": 0.0001, "GBPUSD": 0.0001,
+    "USDJPY": 0.01,   "AUDUSD": 0.0001,
+    "USDCHF": 0.0001, "USDCAD": 0.0001,
+    "GBPJPY": 0.01,   "NAS100": 1.0,
+}
 
-# ── v5.0 -- Filtres qualite d'entree ─────────────────────────
-# [P1-C] Sessions autorisees (UTC)
-SESSION_WHITELIST   = {"LONDON", "NY"}   # Asie + Dead bloques
-SESSION_ASIA_TRADE  = False              # True = autorise l'Asie (deconseille)
+# ── Symboles concernés par le hard news filter ────────────────────────────
+NEWS_SENSITIVE = {"XAUUSD", "EURUSD", "GBPUSD", "NAS100", "USDJPY", "XAGUSD"}
 
-# [P1-B] HTF M15 bias
-HTF_CACHE_SEC       = 900               # 15min de cache
-HTF_GATE_ENABLED    = True              # False = desactive le filtre HTF
+# ── Risk parameters ───────────────────────────────────────────────────────
+FIXED_RISK_USD = float(os.getenv("FIXED_RISK_USD", "50"))  # Risque fixe 50 USD par trade
 
-# [P1-D] BTC correlation
-BTC_CORR_ENABLED    = True              # False = desactive le filtre BTC
-BTC_CACHE_SEC       = 600              # 10min de cache
+# ── Timing ───────────────────────────────────────────────────────────────
+MAX_SIGNALS_PER_DAY  = 10
+MIN_GAP_GLOBAL_MIN   = 30   # gap global minimum entre signaux
+SYMBOL_COOLDOWN_H    = 2    # cooldown par symbole en heures
+SETUP_HASH_TTL_H     = 6    # durée de vie du hash anti-duplicate
+SCAN_INTERVAL_SEC    = 300  # cycle de scan (5 min)
 
-# [P1-E] Volatility spike (news/liquidation)
-SPIKE_ATR_MULT      = 3.5              # bougie > 3.5xATR -> skip
 
-# [P1-G] Break-even automatique
-BE_TRIGGER_R        = 0.5              # declenche BE quand uPnL >= 0.5xrisk_usd
-BE_ENABLED          = True
+# ══════════════════════════════════════════════════════════════════════════
+#  KILLZONE ENGINE
+# ══════════════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════
-#  🚪  v5.3 -- STRATEGIC EXIT ENGINE
-# ══════════════════════════════════════════════════════════════
+# Fenêtres horaires UTC (début inclusif, fin exclusif)
+KILLZONES = {
+    "LONDON_OPEN":  (7,  10),   # 07:00–10:00 UTC
+    "NY_OPEN":      (12, 15),   # 12:00–15:00 UTC
+}
 
-# Mode de clôture global
-# BINANCE_ONLY : 100% ordres exchange (comportement v5.0)
-# STRATEGIC    : moteur Python complet (trailing, partials, time exit)
-# HYBRID       : Binance en priorite + fallback Python si lag API
-CLOSE_MODE          = "STRATEGIC"
+# Score de qualité de session — multiplicateur appliqué au score setup
+SESSION_QUALITY: Dict[str, float] = {
+    "LONDON_OPEN":       1.3,
+    "NY_OPEN":           1.2,
+    "LONDON":            1.0,
+    "LONDON_NY_OVERLAP": 1.1,
+    "NEW_YORK":          0.9,
+    "ASIAN":             0.5,
+    "OFF":               0.4,
+}
 
-# ── Trailing stop ─────────────────────────────────────────────
-# Active après TRAIL_R_STARTxR de profit
-# SL deplace à : mark +/- ATR x TRAIL_ATR_MULT
-# (mark-based = robuste vs micro-spikes en futures)
-TRAIL_R_START       = 2.0              # R minimum pour activer le trailing
-TRAIL_ATR_MULT      = 1.0             # distance trailing = ATR x mult
-
-# ── Partial close ─────────────────────────────────────────────
-# Clôture partielle manuelle si TP2 Binance non touche
-PARTIAL_CLOSE_R2    = True            # active la sortie partielle à 2R
-
-# ── Time exit ─────────────────────────────────────────────────
-# Sortie forcee si trade bloque au-delà de MAX_TRADE_HOURS
-MAX_TRADE_HOURS     = 6               # heures max avant exit force
-
-# ── Adaptive BE ───────────────────────────────────────────────
-# BE_TRIGGER_R dejà defini ci-dessus (0.5) -- conserve pour NORMAL
-BE_FAST_R           = 0.3             # trigger ultra-rapide en vol HIGH
-BE_TIGHT_BUF_MULT   = 3              # diviseur du fee_buffer si score=7 + HTF aligne
-
-GRN="\033[92m"; RED="\033[91m"; YEL="\033[93m"
-CYN="\033[96m"; MAG="\033[95m"; BLD="\033[1m"; RST="\033[0m"
-def grn(t): return f"{GRN}{t}{RST}"
-def red(t): return f"{RED}{t}{RST}"
-def yel(t): return f"{YEL}{t}{RST}"
-def cyn(t): return f"{CYN}{t}{RST}"
-def mag(t): return f"{MAG}{t}{RST}"
-def bld(t): return f"{BLD}{t}{RST}"
-def sep(c="─", n=64): return cyn(c * n)
-
-# ═══════════════════════════════════════════════════════════════
-#  📈  SESSION STATE
-# ═══════════════════════════════════════════════════════════════
-class SessionState:
-    def __init__(self, start_balance: float):
-        self.start_balance   = start_balance
-        self.peak_balance    = start_balance
-        self.current_balance = start_balance
-        self.session_pnl     = 0.0
-        self.total_trades    = 0
-        self.wins            = 0
-        self.losses          = 0
-        self.consecutive_sl  = 0
-        self.paused          = False
-        self.pause_until     = 0.0
-        self.start_time      = time.time()
-        self.last_summary_cycle = 0
-        self.last_trade_time    = 0.0
-        self.longs           = 0
-        self.shorts          = 0
-        self.total_rr        = 0.0
-        self.max_drawdown    = 0.0
-        # Stats IA
-        self.ai_confirmed    = 0
-        self.ai_rejected     = 0
-
-    @property
-    def win_rate(self) -> float:
-        if self.total_trades == 0: return 0.0
-        return round(self.wins / self.total_trades * 100, 1)
-
-    @property
-    def session_gain_mult(self) -> float:
-        if self.start_balance <= 0: return 1.0
-        return self.current_balance / self.start_balance
-
-    def adaptive_risk_pct(self, score: int = 5) -> float:
-        mult      = self.session_gain_mult
-        base_risk = RISK_TIERS[-1][2]
-        for t_min, t_max, risk in RISK_TIERS:
-            if t_min <= mult < t_max:
-                base_risk = risk
-                break
-        if self.current_balance < 10.0:
-            signal_risk = SIGNAL_RISK_SCALE.get(score, RISK_MIN_PCT)
-            return min(signal_risk, RISK_MAX_CAP)
-        signal_bonus = {7: 1.60, 6: 1.30, 5: 1.00}.get(score, 1.00)
-        return min(base_risk * signal_bonus, RISK_MAX_CAP)
-
-    def record_win(self, pnl: float, direction: str = "", rr: float = 0.0):
-        self.wins           += 1
-        self.total_trades   += 1
-        self.session_pnl    += pnl
-        self.consecutive_sl  = 0
-        self.total_rr       += rr
-        self.peak_balance    = max(self.peak_balance, self.current_balance + pnl)
-        if direction == "LONG":  self.longs  += 1
-        if direction == "SHORT": self.shorts += 1
-
-    def record_loss(self, pnl: float, direction: str = "", rr: float = 0.0):
-        self.losses         += 1
-        self.total_trades   += 1
-        self.session_pnl    += pnl
-        self.consecutive_sl += 1
-        self.total_rr       += rr
-        dd = self.peak_balance - self.current_balance
-        if dd > self.max_drawdown: self.max_drawdown = dd
-        if direction == "LONG":  self.longs  += 1
-        if direction == "SHORT": self.shorts += 1
-
-    @property
-    def avg_rr(self) -> float:
-        if self.total_trades == 0: return 0.0
-        return round(self.total_rr / self.total_trades, 2)
-
-    def check_pause(self) -> Tuple[bool, str]:
-        if self.paused:
-            if time.time() < self.pause_until:
-                remaining = round((self.pause_until - time.time()) / 60, 1)
-                return True, f"Pause active -- {remaining}min restantes"
-            else:
-                self.paused = False
-                return False, ""
-        if self.consecutive_sl >= MAX_CONSEC_SL:
-            self.paused      = True
-            self.pause_until = time.time() + PAUSE_AFTER_SL_MIN * 60
-            return True, f"{MAX_CONSEC_SL} SL consecutifs"
-        if self.session_pnl > 0:
-            gain_protected = self.session_pnl * PROFIT_LOCK_PCT
-            balance_floor  = self.start_balance + gain_protected
-            if self.current_balance < balance_floor:
-                return True, (
-                    f"Profit lock declenche "
-                    f"(balance ${self.current_balance:.2f} "
-                    f"< floor ${balance_floor:.2f})"
-                )
-        return False, ""
-
-    def session_duration(self) -> str:
-        elapsed = int(time.time() - self.start_time)
-        h, m    = divmod(elapsed // 60, 60)
-        return f"{h}h{m:02d}m"
-
-    def sniper_can_trade(self) -> Tuple[bool, str]:
-        if not SNIPER_MODE: return True, "sniper OFF"
-        elapsed_min = (time.time() - self.last_trade_time) / 60
-        if elapsed_min < SNIPER_COOLDOWN_MIN:
-            wait = round(SNIPER_COOLDOWN_MIN - elapsed_min, 1)
-            return False, f"sniper cooldown {wait}min"
-        return True, "OK"
-
-    def sniper_record_trade(self):
-        self.last_trade_time = time.time()
-
-# ═══════════════════════════════════════════════════════════════
-#  🤖  AGENT IA ANTHROPIC -- VALIDATEUR DE SIGNAUX
-# ═══════════════════════════════════════════════════════════════
-class AISignalVerifier:
+def get_current_session() -> str:
     """
-    Agent Claude qui valide chaque signal avant exécution.
+    Retourne la session + killzone active selon l'heure UTC.
 
-    Analyse :
-      • Qualité technique du signal (score, CRT, Fib, imbalance)
-      • Cohérence avec la structure de marché récente
-      • Corrélations fondamentales (macro, volatilité, heure)
-      • Risque/récompense ajusté au contexte
-
-    Retourne un verdict avec score de confiance 0-100.
-    Score < AI_MIN_CONFIDENCE → trade rejeté.
+    Ordre de priorité : killzones d'abord, puis sessions générales.
     """
+    h = datetime.datetime.utcnow().hour
+    for kz, (start, end) in KILLZONES.items():
+        if start <= h < end:
+            return kz
+    if 7  <= h < 12:  return "LONDON"
+    if 12 <= h < 16:  return "LONDON_NY_OVERLAP"
+    if 16 <= h < 21:  return "NEW_YORK"
+    if 0  <= h <  7:  return "ASIAN"
+    return "OFF"
 
-    def _build_prompt(self, symbol: str, sig: dict,
-                      highs: list, lows: list, closes: list,
-                      regime: str, ss: "SessionState",
-                      btc_trend: str = "NEUTRAL") -> str:
+def session_to_module_m(session: str) -> str:
+    """Mappe les sessions étendues vers les clés de Module M."""
+    mapping = {
+        "LONDON_OPEN":       "LONDON",
+        "NY_OPEN":           "NEW_YORK",
+        "LONDON":            "LONDON",
+        "LONDON_NY_OVERLAP": "LONDON_NY_OVERLAP",
+        "NEW_YORK":          "NEW_YORK",
+        "ASIAN":             "ASIAN",
+        "OFF":               "OFF",
+    }
+    return mapping.get(session, "OFF")
 
-        n  = min(60, len(closes))
-        c  = closes
-        h  = highs
-        l  = lows
-
-        change_5m  = (c[-1] - c[-5])  / c[-5]  * 100 if len(c) >= 5  else 0
-        change_15m = (c[-1] - c[-15]) / c[-15] * 100 if len(c) >= 15 else 0
-        change_1h  = (c[-1] - c[-60]) / c[-60] * 100 if len(c) >= 60 else 0
-
-        high_20  = max(h[-20:]) if len(h) >= 20 else h[-1]
-        low_20   = min(l[-20:]) if len(l) >= 20 else l[-1]
-        range_20 = high_20 - low_20
-        pos_in_range = (c[-1] - low_20) / range_20 * 100 if range_20 > 0 else 50
-
-        rr = abs(sig["tps"][-1]["price"] - sig["entry"]) / abs(sig["entry"] - sig["sl_raw"]) if abs(sig["entry"] - sig["sl_raw"]) > 0 else 0
-
-        now_hour = datetime.now().hour
-        session  = "ASIE" if 0 <= now_hour < 8 else ("LONDON" if 8 <= now_hour < 13 else ("NY" if 13 <= now_hour < 21 else "OVERLAP/DEAD"))
-
-        return f"""Tu es un trader institutionnel senior spécialisé en crypto futures.
-Ton rôle : valider ou rejeter ce signal AVANT exécution réelle.
-Sois STRICT. Un faux positif coûte du capital réel.
-
-════ SIGNAL SMC/ICT ════
-Paire        : {symbol}
-Direction    : {sig['direction']}
-Entrée       : {sig['entry']:.6f}
-Stop-Loss    : {sig['sl_raw']:.6f} ({abs(sig['entry']-sig['sl_raw'])/sig['entry']*100:.3f}% distance)
-TP1 (+1R)    : {sig['tps'][0]['price']:.6f}
-TP2 (+2R)    : {sig['tps'][1]['price']:.6f}
-TP3 (+3R)    : {sig['tps'][2]['price']:.6f}
-R:R max      : 1:{rr:.2f}
-Score global : {sig['score']}/{SCORE_MAX}
-Pattern CRT  : {sig['crt_name']}
-Zone Fib     : {sig['fib_zone']}
-Déclencheur  : {sig['reason']}
-Imbalance    : {sig.get('imb_fill', 0):.1f}% rempli
-
-════ CONTEXTE MARCHÉ ════
-Volatilité   : {regime} (LOW=calme, NORMAL=sain, HIGH=dangereux)
-Session      : {session} [OK] (filtre session v5 déjà passé)
-Variation 5m : {change_5m:+.2f}%
-Variation 15m: {change_15m:+.2f}%
-Variation 1h : {change_1h:+.2f}%
-Haut 20mn    : {high_20:.6f}
-Bas  20mn    : {low_20:.6f}
-Position dans la range 20mn : {pos_in_range:.1f}% (0%=bas, 100%=haut)
-
-════ [v5.0] ALIGNEMENT HTF ════
-HTF M15 bias : {sig.get('htf_bias', 'N/A')} (BULLISH/BEARISH/NEUTRAL)
-BTC M15 trend: {btc_trend}
-Note : ces deux filtres ont DÉJÀ été vérifiés par le moteur technique.
-       Si HTF ou BTC sont contre la direction, le signal a été rejeté.
-       Ta mission ici est de vérifier la QUALITÉ du setup, pas juste l'alignement.
-
-════ ÉTAT DU BOT ════
-Balance      : ${ss.current_balance:.2f} USDT
-SL consécutifs: {ss.consecutive_sl}/{MAX_CONSEC_SL}
-Win rate     : {ss.win_rate}%
-PnL session  : ${ss.session_pnl:+.4f}
-Capital×     : {ss.session_gain_mult:.2f}x
-
-════ CORRÉLATIONS À ANALYSER ════
-1. SETUP : Score {sig['score']}/7 + HTF {sig.get('htf_bias','?')} + BTC {btc_trend} — combo VRAIMENT solide ?
-2. MOMENTUM : Variation {change_15m:+.2f}% sur 15mn — dans le sens du trade ?
-3. RISQUE : SL {abs(sig['entry']-sig['sl_raw'])/sig['entry']*100:.3f}% — cohérent avec vol {regime} ?
-4. POSITION : Prix à {pos_in_range:.0f}% de la range — optimal pour {sig['direction']} ?
-5. QUALITÉ : Le CRT "{sig['crt_name']}" est-il réellement fort dans ce contexte ?
-
-════ FORMAT DE RÉPONSE ════
-Réponds UNIQUEMENT en JSON valide (sans markdown, sans backticks) :
-{{
-  "verdict": "CONFIRME" ou "REJETTE",
-  "confidence": <entier 0-100>,
-  "reasoning": "<2-3 phrases max expliquant ta décision>",
-  "risk_adjustment": <float 0.5 à 1.2 — facteur multiplicateur du risque>,
-  "key_risk": "<principal risque identifié>",
-  "key_strength": "<principale force du signal>",
-  "session_quality": "<FAVORABLE | NEUTRE | DEFAVORABLE pour ce trade>"
-}}"""
-
-    def verify(self, symbol: str, sig: dict,
-               highs: list, lows: list, closes: list,
-               regime: str, ss: "SessionState",
-               btc_trend: str = "NEUTRAL") -> dict:
-        """
-        Envoie le signal à Claude pour validation.
-        Retourne un dict avec verdict, confidence, reasoning, risk_adjustment.
-        """
-        default_ok = {
-            "confirmed": True, "confidence": 65,
-            "reasoning": "Agent IA non configure -- signal accepte avec risque reduit",
-            "risk_adjustment": 0.8,
-            "key_risk": "Validation IA absente",
-            "key_strength": "Signal technique positif",
-            "session_quality": "NEUTRE",
-        }
-
-        if not AI_ENABLED:
-            return default_ok
-
-        if ANTHROPIC_API_KEY in ("COLLE_TA_CLE_ANTHROPIC", "", None):
-            log("Agent IA: cle Anthropic absente -- fallback risque reduit", "WARN")
-            return default_ok
-
-        try:
-            prompt = self._build_prompt(symbol, sig, highs, lows, closes, regime, ss,
-                                        btc_trend=btc_trend)
-
-            data = json.dumps({
-                "model"     : ANTHROPIC_MODEL,
-                "max_tokens": 600,
-                "messages"  : [{"role": "user", "content": prompt}],
-            }).encode("utf-8")
-
-            req = urlreq.Request(
-                "https://api.anthropic.com/v1/messages",
-                data=data,
-                headers={
-                    "Content-Type"      : "application/json",
-                    "x-api-key"         : ANTHROPIC_API_KEY,
-                    "anthropic-version" : "2023-06-01",
-                },
-                method="POST",
-            )
-
-            with urlreq.urlopen(req, timeout=25) as resp:
-                raw    = json.loads(resp.read())
-                text   = raw["content"][0]["text"].strip()
-                # Nettoyage markdown si Claude en met quand même
-                text   = text.replace("```json", "").replace("```", "").strip()
-                parsed = json.loads(text)
-
-            verdict    = parsed.get("verdict", "REJETTE")
-            confidence = max(0, min(100, int(parsed.get("confidence", 0))))
-            confirmed  = (verdict == "CONFIRME") and (confidence >= AI_MIN_CONFIDENCE)
-
-            return {
-                "confirmed"      : confirmed,
-                "confidence"     : confidence,
-                "reasoning"      : parsed.get("reasoning", "--"),
-                "risk_adjustment": float(parsed.get("risk_adjustment", 1.0)),
-                "key_risk"       : parsed.get("key_risk", "--"),
-                "key_strength"   : parsed.get("key_strength", "--"),
-                "session_quality": parsed.get("session_quality", "NEUTRE"),
-            }
-
-        except json.JSONDecodeError as e:
-            log(f"Agent IA: JSON invalide -> {e} | Fallback risque reduit", "WARN")
-            return {**default_ok, "risk_adjustment": 0.7,
-                    "reasoning": f"Reponse IA non parsable: {e}"}
-        except Exception as e:
-            log(f"Agent IA: erreur reseau -> {e} | Fallback risque reduit", "WARN")
-            return {**default_ok, "risk_adjustment": 0.75,
-                    "reasoning": f"Erreur IA ({type(e).__name__}) -- risque reduit"}
+def session_allows_tier3(session: str) -> bool:
+    """Tier 3 : uniquement sessions actives (pas Asie, pas OFF)."""
+    return session in ("LONDON", "LONDON_OPEN", "LONDON_NY_OVERLAP", "NY_OPEN", "NEW_YORK")
 
 
-# Instance globale de l'agent
-_ai_verifier = AISignalVerifier()
+# ══════════════════════════════════════════════════════════════════════════
+#  NEWS ENGINE
+# ══════════════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════
-#  📝  LOGGER
-# ═══════════════════════════════════════════════════════════════
-LOG_FILE = f"alphabot_v4_{datetime.now().strftime('%Y%m%d')}.log"
+_news_cache: Dict = {"events": [], "expires": 0}
 
-def log(msg: str, level: str = "INFO"):
-    ts  = datetime.now().strftime("%H:%M:%S")
-    col = {"INFO": CYN, "TRADE": GRN, "WARN": YEL,
-           "ERROR": RED, "PAUSE": MAG, "AI": MAG}.get(level, RST)
-    line = f"[{ts}][{level}] {msg}"
-    print(f"{col}{line}{RST}")
+def _fetch_news_events() -> List[Dict]:
+    """Télécharge le calendrier ForexFactory JSON de la semaine. Cache 15 min."""
+    global _news_cache
+    now = time.time()
+
+    if now < _news_cache["expires"]:
+        return _news_cache["events"]
+
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
-
-# ═══════════════════════════════════════════════════════════════
-#  📨  TELEGRAM
-# ═══════════════════════════════════════════════════════════════
-_tg_enabled = False
-
-def _tg_raw(msg: str):
-    if not _tg_enabled: return
-    try:
-        url  = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        data = json.dumps({
-            "chat_id"   : TG_CHAT_ID,
-            "text"      : msg,
-            "parse_mode": "HTML",
-        }).encode("utf-8")
-        req = urlreq.Request(
-            url, data=data,
-            headers={"Content-Type": "application/json"},
+        resp = requests.get(
+            "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+            timeout=6,
         )
-        urlreq.urlopen(req, timeout=10)
+        if resp.status_code == 200:
+            _news_cache = {"events": resp.json(), "expires": now + 900}
+            return _news_cache["events"]
     except Exception as e:
-        log(f"Telegram erreur: {e}", "WARN")
+        log.warning("ForexFactory fetch failed : %s", e)
 
-def tg_check() -> bool:
-    global _tg_enabled
-    if TG_TOKEN in ("COLLE_TON_TOKEN_TG", "", None):
-        log("Telegram non configure -- notifications desactivees", "WARN")
+    _news_cache["expires"] = now + 300   # retry dans 5 min
+    return _news_cache.get("events", [])
+
+
+def get_news_risk() -> str:
+    """Niveau de risque news global : NONE | MEDIUM | HIGH | NFP."""
+    events   = _fetch_news_events()
+    utc_now  = datetime.datetime.utcnow()
+    risk     = "NONE"
+
+    for ev in events:
+        ev_time_str = ev.get("date", "")
+        if not ev_time_str:
+            continue
+        try:
+            ev_dt = datetime.datetime.fromisoformat(ev_time_str.replace("Z", "+00:00"))
+            ev_dt = ev_dt.replace(tzinfo=None)
+        except ValueError:
+            continue
+
+        diff_min = (utc_now - ev_dt).total_seconds() / 60
+        if not (-30 <= diff_min <= 30):
+            continue
+
+        impact = ev.get("impact", "").upper()
+        title  = ev.get("title", "").upper()
+
+        if "NON-FARM" in title or "NFP" in title:
+            return "NFP"
+        elif impact == "HIGH":
+            risk = "HIGH"
+        elif impact == "MEDIUM" and risk == "NONE":
+            risk = "MEDIUM"
+
+    return risk
+
+
+def news_hard_block(symbol: str, news_risk: str) -> bool:
+    """
+    Retourne True si ce symbole doit être bloqué (NO-TRADE zone).
+
+    Règle : si news HIGH ou NFP dans ±20 min, bloquer les paires sensibles.
+    MEDIUM → avertissement seulement (Module M élargit le SL suffisamment).
+    """
+    if symbol not in NEWS_SENSITIVE:
         return False
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/getMe"
-        with urlreq.urlopen(url, timeout=8) as r:
-            data = json.loads(r.read())
-            if data.get("ok"):
-                _tg_enabled = True
-                log(f"Telegram OK -> @{data['result']['username']}", "INFO")
-                return True
-    except Exception as e:
-        log(f"Telegram check echoue: {e}", "WARN")
+
+    events  = _fetch_news_events()
+    utc_now = datetime.datetime.utcnow()
+
+    for ev in events:
+        ev_time_str = ev.get("date", "")
+        if not ev_time_str:
+            continue
+        try:
+            ev_dt = datetime.datetime.fromisoformat(ev_time_str.replace("Z", "+00:00"))
+            ev_dt = ev_dt.replace(tzinfo=None)
+        except ValueError:
+            continue
+
+        diff_min = (utc_now - ev_dt).total_seconds() / 60
+        if not (-20 <= diff_min <= 20):
+            continue
+
+        impact = ev.get("impact", "").upper()
+        title  = ev.get("title", "").upper()
+
+        if "NON-FARM" in title or "NFP" in title:
+            log.info("  %s : BLOCKED — NFP dans %.0f min", symbol, diff_min)
+            return True
+        if impact == "HIGH":
+            log.info("  %s : BLOCKED — HIGH news dans %.0f min", symbol, diff_min)
+            return True
+
     return False
 
-def tg_send(msg: str):
-    _tg_raw(msg)
 
-def tg_startup(ss: "SessionState"):
-    eff_lev    = get_effective_leverage(ss.start_balance)
-    eff_margin = get_effective_margin_pct(ss.start_balance)
-    micro_str  = " 🔬 MICRO COMPTE" if is_micro_account(ss.start_balance) else ""
-    ai_str     = "[OK] Active" if AI_ENABLED and ANTHROPIC_API_KEY not in ("COLLE_TA_CLE_ANTHROPIC","") else "❌ Desactive"
-    _tg_raw(
-        f"<b>🤖 AlphaBot Futures v4.0 -- DÉMARRÉ{micro_str}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Balance depart : <code>${ss.start_balance:.2f} USDT</code>\n"
-        f"⚙️ Levier effectif: <b>{eff_lev}x</b> ISOLATED\n"
-        f"📊 Risque initial : {ss.adaptive_risk_pct(score=5)*100:.1f}%/trade\n"
-        f"🤖 Agent IA       : {ai_str} (confiance min {AI_MIN_CONFIDENCE}%)\n"
-        f"🌐 Pool marches   : {len(SYMBOLS)} paires\n"
-        f"🏆 Top selection  : {TOP_N_SYMBOLS} meilleures paires\n"
-        f"⏸️ Pause auto     : après {MAX_CONSEC_SL} SL ({PAUSE_AFTER_SL_MIN}min)\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Bugs v3.0 corriges | Agent IA validateur actif 💪</i>"
-    )
+# ══════════════════════════════════════════════════════════════════════════
+#  DATA CACHE + FETCHER
+# ══════════════════════════════════════════════════════════════════════════
 
-def tg_ai_verdict(symbol: str, sig: dict, ai_result: dict):
-    """Notification Telegram du verdict IA pour chaque signal."""
-    emoji  = "[OK]" if ai_result["confirmed"] else "❌"
-    color  = "🟢" if ai_result["confirmed"] else "🔴"
-    risk_str = f"{ai_result['risk_adjustment']:.1f}x"
-    _tg_raw(
-        f"<b>🤖 Agent IA -- {emoji} {ai_result['confidence']}% confiance</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 Paire     : <b>{symbol}</b> {sig['direction']}\n"
-        f"🎯 Verdict   : {color} <b>{'CONFIRME' if ai_result['confirmed'] else 'REJETTE'}</b>\n"
-        f"📊 Confiance : <b>{ai_result['confidence']}%</b> (seuil: {AI_MIN_CONFIDENCE}%)\n"
-        f"⚠️ Risquex   : <code>{risk_str}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💭 Analyse   : {ai_result['reasoning']}\n"
-        f"* Force      : {ai_result['key_strength']}\n"
-        f"⛔ Risque    : {ai_result['key_risk']}\n"
-        f"🕐 Session   : {ai_result.get('session_quality','--')}"
-    )
+# TTL par timeframe en secondes
+_CACHE_TTL = {"15m": 120, "30m": 180, "1h": 300, "4h": 900, "1d": 3600}
+_ohlc_cache: Dict[Tuple[str, str], Dict] = {}
 
-def tg_trade_open(trade: dict, ss: "SessionState"):
-    d        = trade["direction"]
-    arrow    = "🟢 LONG" if d == "LONG" else "🔴 SHORT"
-    tps      = trade["tps"]
-    entry    = trade["entry"]
-    sl       = trade["sl"]
-    score    = trade["score"]
-    eff_lev  = get_effective_leverage(ss.current_balance)
-    notional = trade["qty"] * entry
-    margin   = notional / eff_lev
-    fees_est = notional * FEE_RATE * 2
-    sl_pct   = round(abs(entry - sl) / entry * 100, 3)
-    sl_usd   = abs(entry - sl) * trade["qty"]
-    micro    = "🔬 MICRO" if is_micro_account(ss.current_balance) else ""
-    tier_label = {7: "🏆 ÉLITE", 6: "💎 PREMIUM", 5: "[OK] SOLIDE"}.get(score, "-")
-    risk_used  = ss.adaptive_risk_pct(score=score) * 100
-    ai_conf    = trade.get("ai_confidence", "N/A")
-    ai_adj     = trade.get("ai_risk_adj", 1.0)
 
-    tp_lines = ""
-    for i, t in enumerate(tps):
-        tp_dist = abs(t["price"] - entry)
-        tp_gain = tp_dist * trade["qty"] * t["pct"] - fees_est * t["pct"]
-        tp_lines += (
-            f"  TP{i+1} <code>{t['price']:.6f}</code>  "
-            f"{int(t['pct']*100)}%pos  @{t['r']}R  "
-            f"~+<code>${tp_gain:.4f}</code>\n"
-        )
-
-    rr = round(abs(tps[-1]["price"]-entry)/abs(entry-sl), 2) if abs(entry-sl) > 0 else 0
-    growth = round((ss.session_gain_mult - 1) * 100, 1)
-    growth_str = f"+{growth}%" if growth >= 0 else f"{growth}%"
-
-    _tg_raw(
-        f"<b>⚡ TRADE OUVERT -- {arrow}</b> {micro}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 Paire     : <b>{trade['symbol']}</b>\n"
-        f"🎯 Entree    : <code>{entry:.6f}</code>\n"
-        f"🛑 SL        : <code>{sl:.6f}</code>  ({sl_pct}% / -${sl_usd:.4f})\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{tp_lines}"
-        f"📐 R:R max   : 1:{rr}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📦 Quantite  : <code>{trade['qty']}</code>\n"
-        f"💵 Notionnel : <code>${notional:.2f}</code>\n"
-        f"🔐 Marge     : <code>${margin:.2f}</code>  ({eff_lev}x ISOLÉE)\n"
-        f"💸 Frais est.: <code>~${fees_est:.4f}</code>\n"
-        f"⚠️ Risque    : <code>${trade['risk_usd']:.4f}</code>  ({risk_used:.1f}%  x{ai_adj:.1f} IA)\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Signal    : {tier_label}  Score:{score}/{SCORE_MAX}\n"
-        f"🤖 IA        : [OK] {ai_conf}% confiance\n"
-        f"🕯️ CRT       : {trade['crt_name']}\n"
-        f"📐 Fibonacci : {trade['fib_zone']}\n"
-        f"🧲 Raison    : {trade['reason']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Balance   : <code>${ss.current_balance:.2f}</code>\n"
-        f"📈 Session   : {ss.wins}W / {ss.losses}L  |  WR {ss.win_rate}%\n"
-        f"💹 PnL sess  : <code>${ss.session_pnl:+.4f}</code>  ({growth_str})\n"
-        f"🤖 IA stats  : [OK]{ss.ai_confirmed} confirmes / ❌{ss.ai_rejected} rejetes"
-    )
-
-def tg_trade_close(trade: dict, pnl: float, reason: str, ss: "SessionState"):
-    win      = pnl >= 0
-    emoji    = "🏆 WIN" if win else "💔 LOSS"
-    dur      = round((time.time() - trade.get("open_time", time.time())) / 60, 1)
-    notional = trade["qty"] * trade["entry"]
-    fees_est = notional * FEE_RATE * 2
-    pnl_net  = pnl - fees_est
-    r_dist   = abs(trade["entry"] - trade["sl"])
-    r_real   = round(abs(pnl) / (r_dist * trade["qty"]), 2) if r_dist > 0 else 0
-    r_str    = f"+{r_real}R 🎯" if win else f"-{r_real}R"
-    growth   = round((ss.session_gain_mult - 1) * 100, 1)
-    growth_str = f"+{growth}%" if growth >= 0 else f"{growth}%"
-    tp_str   = ", ".join(f"TP{i+1}" for i,t in enumerate(trade.get("tps",[])) if t.get("hit")) or "aucun"
-
-    _tg_raw(
-        f"<b>{emoji} -- {trade['symbol']} {trade['direction']}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 Entree    : <code>{trade['entry']:.6f}</code>\n"
-        f"[OK] TP touches : {tp_str}\n"
-        f"🔍 Clôture   : {reason}  |  ⏱️ {dur}min\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 PnL brut  : <code>${pnl:+.4f}</code>  ({r_str})\n"
-        f"💸 Frais     : <code>-${fees_est:.4f}</code>\n"
-        f"💡 PnL net   : <code>${pnl_net:+.4f}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Balance   : <code>${ss.current_balance:.2f}</code>\n"
-        f"📈 Session   : {ss.wins}W / {ss.losses}L  |  WR {ss.win_rate}%\n"
-        f"💹 PnL sess  : <code>${ss.session_pnl:+.4f}</code>  ({growth_str})\n"
-        f"🤖 IA stats  : [OK]{ss.ai_confirmed} confirmes / ❌{ss.ai_rejected} rejetes"
-    )
-
-def tg_pause(reason: str, ss: "SessionState"):
-    _tg_raw(
-        f"<b>⏸️ PAUSE AUTOMATIQUE</b>\n"
-        f"⚠️ Raison    : {reason}\n"
-        f"⏳ Duree     : {PAUSE_AFTER_SL_MIN}min\n"
-        f"📊 Session   : {ss.wins}W/{ss.losses}L\n"
-        f"💰 Balance   : <code>${ss.current_balance:.2f}</code>\n"
-        f"<i>Reprise dans {PAUSE_AFTER_SL_MIN}min...</i>"
-    )
-
-def tg_resume(ss: "SessionState"):
-    _tg_raw(
-        f"<b>▶️ REPRISE DU BOT</b>\n"
-        f"💰 Balance: <code>${ss.current_balance:.2f}</code>\n"
-        f"📊 {ss.wins}W/{ss.losses}L | PnL: ${ss.session_pnl:+.4f}"
-    )
-
-def tg_hourly_summary(ss: "SessionState", positions: dict):
-    pos_lines = ""
-    for sym, t in positions.items():
-        pos_lines += f"\n  • {sym} {t['direction']} @ {t['entry']:.6f}  SL:{t['sl']:.6f}"
-    if not pos_lines: pos_lines = "\n  Aucune position ouverte"
-    growth     = round((ss.session_gain_mult - 1) * 100, 1)
-    growth_str = f"+{growth}%" if growth >= 0 else f"{growth}%"
-    _tg_raw(
-        f"<b>📊 RÉSUMÉ -- AlphaBot v4.0</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Balance     : <code>${ss.current_balance:.2f}</code>\n"
-        f"📈 Capital x   : {ss.session_gain_mult:.2f}x  ({growth_str})\n"
-        f"💹 PnL session : <code>${ss.session_pnl:+.4f}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 Bilan       : {ss.wins}W / {ss.losses}L  |  WR {ss.win_rate}%\n"
-        f"📐 R:R moyen   : {ss.avg_rr:+.2f}R\n"
-        f"🤖 Agent IA    : [OK]{ss.ai_confirmed} OK / ❌{ss.ai_rejected} rejetes\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ Duree sess  : {ss.session_duration()}\n"
-        f"<b>Positions actives :</b>{pos_lines}"
-    )
-
-# ═══════════════════════════════════════════════════════════════
-#  🔑  BINANCE FUTURES API
-# ═══════════════════════════════════════════════════════════════
-BASE_URL = "https://fapi.binance.com"
-_time_offset_ms: int = 0
-
-def sync_server_time():
-    global _time_offset_ms
-    try:
-        url = f"{BASE_URL}/fapi/v1/time"
-        with urlreq.urlopen(url, timeout=10) as r:
-            server_time = json.loads(r.read())["serverTime"]
-            _time_offset_ms = server_time - int(time.time() * 1000)
-            log(f"⏱️  Synchro horloge OK -- offset: {_time_offset_ms}ms", "INFO")
-    except Exception as e:
-        log(f"Synchro horloge echouee: {e}", "WARN")
-        _time_offset_ms = 0
-
-def _get_timestamp() -> int:
-    return int(time.time() * 1000) + _time_offset_ms
-
-def _sign(qs: str) -> str:
-    return hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
-
-def _request(method: str, path: str,
-             params: dict = None, signed: bool = False) -> Optional[any]:
-    params = dict(params or {})
-    if signed:
-        params["timestamp"]  = _get_timestamp()
-        params["recvWindow"] = 10000
-        qs  = urlparse.urlencode(params)
-        params["signature"] = _sign(qs)
-
-    qs  = urlparse.urlencode(params)
-    url = f"{BASE_URL}{path}"
-
-    try:
-        if method == "GET":
-            req = urlreq.Request(
-                f"{url}?{qs}",
-                headers={"X-MBX-APIKEY": API_KEY},
-            )
-        elif method == "POST":
-            req = urlreq.Request(
-                url, data=qs.encode(), method="POST",
-                headers={
-                    "X-MBX-APIKEY": API_KEY,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-            )
-        elif method == "DELETE":
-            req = urlreq.Request(
-                f"{url}?{qs}", method="DELETE",
-                headers={"X-MBX-APIKEY": API_KEY},
-            )
-        else:
-            return None
-
-        with urlreq.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode())
-
-    except urlerr.HTTPError as e:
-        body = e.read().decode()
-        # ── 418 : IP bannie par Binance ───────────────────────
-        if e.code == 418:
-            # Extraire la durée du ban si disponible dans le message
-            wait_sec = 90  # attente minimale prudente
-            try:
-                banned_data = json.loads(body)
-                banned_msg  = banned_data.get("msg", "")
-                # Format : "banned until <timestamp_ms>"
-                if "banned until" in banned_msg:
-                    ban_ts_ms  = int(banned_msg.split("banned until")[1].strip().split(".")[0])
-                    wait_sec   = max(90, (ban_ts_ms - int(time.time() * 1000)) // 1000 + 5)
-                    wait_min   = round(wait_sec / 60, 1)
-                    log(
-                        f"🚫 IP BANNIE Binance (418) -- ban jusqu'à {ban_ts_ms}ms "
-                        f"-- attente {wait_min}min",
-                        "ERROR",
-                    )
-                    tg_send(
-                        f"🚫 <b>IP Bannie Binance !</b>\n"
-                        f"Durée : <code>{wait_min} min</code>\n"
-                        f"Bot en pause automatique -- reprise dans {wait_min}min."
-                    )
-                    # On attend par tranches de 30s pour rester réactif
-                    slept = 0
-                    while slept < wait_sec:
-                        chunk = min(30, wait_sec - slept)
-                        time.sleep(chunk)
-                        slept += chunk
-                        remaining = round((wait_sec - slept) / 60, 1)
-                        if remaining > 0:
-                            log(f"  🚫 Ban Binance -- encore {remaining}min...", "WARN")
-                else:
-                    log(f"🚫 IP Bannie Binance (418) -- attente {wait_sec}s", "ERROR")
-                    tg_send(f"🚫 <b>IP Bannie Binance (418)</b> -- attente {wait_sec}s")
-                    time.sleep(wait_sec)
-            except Exception:
-                log(f"🚫 IP Bannie Binance (418) -- attente {wait_sec}s", "ERROR")
-                time.sleep(wait_sec)
-            return None
-        # ── 429 : rate limit (pas encore banni) ──────────────
-        elif e.code == 429:
-            log(f"⚠️ Rate limit Binance (429) -- attente 10s", "WARN")
-            time.sleep(10)
-            return None
-        log(f"API {method} {path} -> HTTP {e.code}: {body}", "ERROR")
+def _cache_get(symbol: str, interval: str) -> Optional[List[Dict]]:
+    key  = (symbol, interval)
+    entry = _ohlc_cache.get(key)
+    if not entry:
         return None
-    except Exception as e:
-        log(f"API {method} {path} -> {e}", "ERROR")
+    ttl = _CACHE_TTL.get(interval, 300)
+    if time.time() - entry["ts"] > ttl:
+        return None
+    return entry["data"]
+
+
+def _cache_set(symbol: str, interval: str, data: List[Dict]):
+    _ohlc_cache[(symbol, interval)] = {"ts": time.time(), "data": data}
+
+
+def fetch_candles_yf(symbol: str, interval: str, bars: int = 150) -> Optional[List[Dict]]:
+    ticker = YF_TICKERS.get(symbol)
+    if not ticker:
         return None
 
-def get_klines(symbol: str, interval: str = "1m", limit: int = 220):
-    return _request("GET", "/fapi/v1/klines",
-                    {"symbol": symbol, "interval": interval, "limit": limit})
+    period_map = {"15m": "5d", "30m": "7d", "1h": "30d", "4h": "60d", "1d": "1y"}
+    period = period_map.get(interval, "30d")
 
-def get_exchange_info():
-    return _request("GET", "/fapi/v1/exchangeInfo")
+    try:
+        df = yf.download(ticker, period=period, interval=interval,
+                         progress=False, auto_adjust=True)
+        if df.empty or len(df) < 20:
+            return None
 
-def get_mark_price(symbol: str) -> Optional[dict]:
-    return _request("GET", "/fapi/v1/markPrice", {"symbol": symbol})
+        df = df.tail(bars)
+        candles = []
+        for ts, row in df.iterrows():
+            candles.append({
+                "time":   ts.timestamp(),
+                "open":   float(row["Open"]),
+                "high":   float(row["High"]),
+                "low":    float(row["Low"]),
+                "close":  float(row["Close"]),
+                "volume": float(row.get("Volume", 0)),
+            })
+        return candles
 
-def get_balance_usdt() -> float:
-    for _attempt in range(3):
-        resp = _request("GET", "/fapi/v2/balance", {}, signed=True)
-        if isinstance(resp, list):
-            for a in resp:
-                if a.get("asset") == "USDT":
-                    return float(a.get("availableBalance", 0))
-            return 0.0
-        if _attempt < 2:
-            log(f"Balance indisponible (essai {_attempt+1}/3) -- retry 5s...", "WARN")
-            time.sleep(5)
-    return 0.0
+    except Exception as e:
+        log.error("yfinance %s/%s : %s", symbol, interval, e)
+        return None
 
-def get_open_positions() -> List[dict]:
-    resp = _request("GET", "/fapi/v2/positionRisk", {}, signed=True)
-    if not isinstance(resp, list): return []
-    return [p for p in resp if abs(float(p.get("positionAmt", 0))) > 1e-9]
 
-def set_leverage_api(symbol: str, lev: int) -> bool:
-    resp = _request("POST", "/fapi/v1/leverage",
-                    {"symbol": symbol, "leverage": lev}, signed=True)
-    return isinstance(resp, dict) and "leverage" in resp
+def fetch_candles_binance(symbol: str, interval: str, bars: int = 150) -> Optional[List[Dict]]:
+    binance_sym = BINANCE_SYMBOLS.get(symbol, symbol)
+    url    = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": binance_sym, "interval": interval, "limit": bars}
 
-def set_margin_isolated(symbol: str):
-    _request("POST", "/fapi/v1/marginType",
-             {"symbol": symbol, "marginType": "ISOLATED"}, signed=True)
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        candles = []
+        for k in resp.json():
+            candles.append({
+                "time":   k[0] / 1000,
+                "open":   float(k[1]),
+                "high":   float(k[2]),
+                "low":    float(k[3]),
+                "close":  float(k[4]),
+                "volume": float(k[5]),
+            })
+        return candles
+    except Exception as e:
+        log.error("Binance %s/%s : %s", symbol, interval, e)
+        return None
 
-def place_order(symbol: str, side: str, order_type: str,
-                quantity: str, stop_price: str = None,
-                reduce_only: bool = False) -> Optional[dict]:
-    params = {
-        "symbol"    : symbol,
-        "side"      : side,
-        "type"      : order_type,
-        "quantity"  : quantity,
-        "reduceOnly": "true" if reduce_only else "false",
-    }
-    if stop_price:
-        params["stopPrice"]   = stop_price
-        params["workingType"] = "MARK_PRICE"
-        params["timeInForce"] = "GTC"
-    return _request("POST", "/fapi/v1/order", params, signed=True)
 
-def cancel_all_orders(symbol: str):
-    _request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
+def fetch_candles(symbol: str, interval: str, bars: int = 150) -> Optional[List[Dict]]:
+    """Fetch avec cache TTL. Route vers Binance ou yfinance."""
+    cached = _cache_get(symbol, interval)
+    if cached is not None:
+        return cached
 
-# ═══════════════════════════════════════════════════════════════
-#  📐  CACHE SYMBOLES
-# ═══════════════════════════════════════════════════════════════
-_sym_info: Dict[str, dict] = {}
-
-def load_symbol_info() -> bool:
-    global _sym_info
-    for _attempt in range(5):
-        info = get_exchange_info()
-        if info and "symbols" in info:
-            break
-        log(f"Impossible de charger exchangeInfo (essai {_attempt+1}/5) -- retry 30s...", "ERROR")
-        time.sleep(30)
+    if symbol in BINANCE_SYMBOLS:
+        data = fetch_candles_binance(symbol, interval, bars)
     else:
-        log("exchangeInfo toujours indisponible après 5 essais -- abandon", "ERROR")
-        return False
-    for s in info["symbols"]:
-        sym = s["symbol"]
-        d   = {"stepSize": 1.0, "tickSize": 0.0001,
-               "minQty": 1.0, "minNotional": 5.0}
-        for f in s.get("filters", []):
-            ft = f["filterType"]
-            if ft == "LOT_SIZE":
-                d["stepSize"] = float(f["stepSize"])
-                d["minQty"]   = float(f["minQty"])
-            elif ft == "PRICE_FILTER":
-                d["tickSize"] = float(f["tickSize"])
-            elif ft == "MIN_NOTIONAL":
-                d["minNotional"] = float(f.get("notional", 5.0))
-        _sym_info[sym] = d
-    log(f"Exchange info: {len(_sym_info)} symboles charges", "INFO")
-    return True
+        data = fetch_candles_yf(symbol, interval, bars)
 
-def _prec(step: float) -> int:
-    if step <= 0 or step >= 1: return 0
-    return max(0, -int(math.floor(math.log10(step))))
+    if data:
+        _cache_set(symbol, interval, data)
+    return data
 
-def round_step(v: float, step: float) -> float:
-    if step <= 0: return v
-    return round(math.floor(v / step) * step, _prec(step))
 
-def round_tick(v: float, tick: float) -> float:
-    if tick <= 0: return v
-    return round(round(v / tick) * tick, _prec(tick))
+# ══════════════════════════════════════════════════════════════════════════
+#  INDICATEURS TECHNIQUES
+# ══════════════════════════════════════════════════════════════════════════
 
-def fmt_qty(qty: float, step: float) -> str: return f"{qty:.{_prec(step)}f}"
-def fmt_px(px: float, tick: float)   -> str: return f"{px:.{_prec(tick)}f}"
+def compute_atr(candles: List[Dict], period: int = 14) -> float:
+    if len(candles) < period + 1:
+        return 0.0
+    trs = []
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return round(atr, 8)
 
-# ═══════════════════════════════════════════════════════════════
-#  💰  RISK MANAGER v4
-# ═══════════════════════════════════════════════════════════════
-def calc_atr(highs: list, lows: list, closes: list, n: int = ATR_PERIOD) -> float:
-    if len(highs) < n + 1: return 0.0
-    trs = [max(highs[i] - lows[i],
-               abs(highs[i] - closes[i-1]),
-               abs(lows[i]  - closes[i-1])) for i in range(-n, 0)]
-    return sum(trs) / len(trs)
 
-def structural_sl(highs: list, lows: list, direction: str,
-                  entry: float, atr: float) -> Tuple[float, str]:
-    """
-    SL basé sur la structure du marché (swing high/low).
-    LONG  → SL sous le dernier swing low
-    SHORT → SL au-dessus du dernier swing high
-    """
-    margin = atr * 0.5
+def compute_ema(closes: List[float], period: int) -> List[float]:
+    if len(closes) < period:
+        return []
+    k = 2 / (period + 1)
+    ema = [sum(closes[:period]) / period]
+    for c in closes[period:]:
+        ema.append(c * k + ema[-1] * (1 - k))
+    return ema
 
-    if direction == "LONG":
-        recent_lows = lows[-21:-1]
-        if recent_lows:
-            sl     = min(recent_lows) - margin
-            source = "SwingLow"
-        else:
-            sl     = entry - atr * 2
-            source = "ATRx2"
-        if sl >= entry:
-            sl = entry - atr * 2
-            source = "ATRx2_fix"
-    else:
-        recent_highs = highs[-21:-1]
-        if recent_highs:
-            sl     = max(recent_highs) + margin
-            source = "SwingHigh"
-        else:
-            sl     = entry + atr * 2
-            source = "ATRx2"
-        if sl <= entry:
-            sl = entry + atr * 2
-            source = "ATRx2_fix"
-
-    # Buffer frais minimum
-    fee_buffer = entry * FEE_RATE * 4
-    if abs(entry - sl) < fee_buffer:
-        sl     = entry - fee_buffer if direction == "LONG" else entry + fee_buffer
-        source = "FEE_MIN"
-
-    return sl, source
-
-def dynamic_sl(entry: float, sl_signal: float, direction: str,
-               atr: float) -> Tuple[float, str]:
-    sl_struct = (entry - atr * SL_ATR_MIN_FACTOR if direction == "LONG"
-                 else entry + atr * SL_ATR_MIN_FACTOR)
-    if direction == "LONG":
-        sl = min(sl_signal, sl_struct)
-    else:
-        sl = max(sl_signal, sl_struct)
-    source = "SMC+ATR"
-    fee_buffer  = entry * FEE_RATE * 2
-    min_sl_dist = fee_buffer * 2
-    if abs(entry - sl) < min_sl_dist:
-        sl     = entry - min_sl_dist if direction == "LONG" else entry + min_sl_dist
-        source = "FEE_BUFFER"
-    return sl, source
-
-def adaptive_max_positions(balance: float) -> int:
-    if balance < 10:  return 1
-    if balance < 30:  return 2
-    return 3
-
-def get_effective_leverage(balance: float) -> int:
-    if balance < 2:   return 75
-    if balance < 5:   return 50
-    if balance < 15:  return 30
-    if balance < 50:  return 25
-    return LEVERAGE
-
-def get_effective_margin_pct(balance: float) -> float:
-    if balance < 2:   return 0.40
-    if balance < 5:   return 0.45
-    if balance < 15:  return 0.35
-    if balance < 50:  return 0.25
-    return MAX_MARGIN_PCT
-
-def is_micro_account(balance: float) -> bool:
-    return balance < 10.0
-
-def calc_position_size(symbol: str, balance: float, risk_pct: float,
-                       entry: float, sl: float) -> Tuple[float, float, str]:
-    if symbol not in _sym_info:
-        return 0.0, 0.0, f"Symbole inconnu: {symbol}"
-    info = _sym_info[symbol]
-
-    eff_lev        = get_effective_leverage(balance)
-    eff_margin_pct = get_effective_margin_pct(balance)
-    sl_dist_pct    = abs(entry - sl) / entry if entry > 0 else 0
-
-    if sl_dist_pct < 0.0015:
-        return 0.0, 0.0, f"SL trop serre ({sl_dist_pct*100:.3f}%) -> skip"
-    if sl_dist_pct > 0.05:
-        return 0.0, 0.0, f"SL trop large ({sl_dist_pct*100:.2f}%) -> skip"
-
-    risk_usd     = balance * risk_pct
-    notional_raw = risk_usd / sl_dist_pct
-    max_notional = balance * eff_margin_pct * eff_lev
-    notional     = min(notional_raw, max_notional)
-
-    if notional < info["minNotional"]:
-        min_qty_notional = info["minQty"] * entry
-        if min_qty_notional >= info["minNotional"]:
-            margin_needed = min_qty_notional / eff_lev
-            if margin_needed <= balance * eff_margin_pct:
-                actual_risk_pct = info["minQty"] * abs(entry - sl) / balance
-                if actual_risk_pct <= 0.12:
-                    return info["minQty"], min_qty_notional, ""
-        return 0.0, 0.0, (
-            f"Notionnel ${notional:.2f} < min ${info['minNotional']} "
-            f"(balance=${balance:.2f} lev={eff_lev}x)"
-        )
-
-    qty = round_step(notional / entry, info["stepSize"])
-    if qty < info["minQty"]:
-        min_qty_notional = info["minQty"] * entry
-        if min_qty_notional >= info["minNotional"]:
-            margin_needed = min_qty_notional / eff_lev
-            if margin_needed <= balance * eff_margin_pct:
-                return info["minQty"], min_qty_notional, ""
-        return 0.0, 0.0, f"Qty {qty} < minQty {info['minQty']}"
-
-    return qty, qty * entry, ""
-
-# ═══════════════════════════════════════════════════════════════
-#  📊  MOTEUR DE SIGNAL SMC/CRT v4.0
-# ═══════════════════════════════════════════════════════════════
-def market_structure(highs, lows):
-    ph, pl = [], []
-    for i in range(2, len(highs) - 2):
-        if (highs[i]>highs[i-1] and highs[i]>highs[i-2]
-                and highs[i]>highs[i+1] and highs[i]>highs[i+2]):
-            ph.append(highs[i])
-        if (lows[i]<lows[i-1] and lows[i]<lows[i-2]
-                and lows[i]<lows[i+1] and lows[i]<lows[i+2]):
-            pl.append(lows[i])
-    if len(ph)<2 or len(pl)<2: return "NEUTRAL"
-    if ph[-1]>ph[-2] and pl[-1]>pl[-2]: return "BULLISH"
-    if ph[-1]<ph[-2] and pl[-1]<pl[-2]: return "BEARISH"
-    return "NEUTRAL"
-
-def bos_choch(closes, highs, lows, opens, structure, atr: float):
-    """
-    [P1-A] BOS/CHOCH avec filtre displacement.
-    Deux conditions obligatoires avant de valider un BOS :
-      1. body ≥ 0.6×ATR  → bougie d'impulsion réelle, pas une mèche
-      2. close ≥ structure + 0.15% → clôture clairement au-delà
-    Élimine la majorité des fake breakouts / stop-hunts 1m.
-    """
-    if len(closes) < 20: return None
-    rh, rl   = max(highs[-20:-1]), min(lows[-20:-1])
-    last     = closes[-1]
-    body     = abs(closes[-1] - opens[-1])
-    min_body = atr * 0.6          # displacement minimum
-
-    if last > rh:
-        if body < min_body:           return None   # bougie faible -> rejet
-        if last < rh * 1.0015:        return None   # clôture trop rase du niveau
-        return "BOS_BULL" if structure == "BULLISH" else "CHOCH_BULL"
-
-    if last < rl:
-        if body < min_body:           return None
-        if last > rl * 0.9985:        return None
-        return "BOS_BEAR" if structure == "BEARISH" else "CHOCH_BEAR"
-
-    return None
-
-def breakout_retest(highs, lows, closes):
-    if len(closes)<40: return None, None
-    res  = max(highs[-40:-10]); sup = min(lows[-40:-10])
-    prev = closes[-6:-1]
-    if any(x>res for x in prev) and closes[-1]>res*0.997: return "BULL_RETEST", res
-    if any(x<sup for x in prev) and closes[-1]<sup*1.003: return "BEAR_RETEST", sup
-    return None, None
-
-def order_block(opens, closes, highs, lows, direction):
-    L = len(closes)
-    for i in range(L - OB_LOOKBACK - 1, L - 1):
-        if direction=="LONG":
-            if closes[i]<opens[i]:
-                mv=closes[i+1]-opens[i+1]; bd=abs(closes[i]-opens[i])
-                if mv>0 and bd>0 and mv>1.5*bd: return highs[i], lows[i]
-        else:
-            if closes[i]>opens[i]:
-                mv=opens[i+1]-closes[i+1]; bd=abs(closes[i]-opens[i])
-                if mv>0 and bd>0 and mv>1.5*bd: return highs[i], lows[i]
-    return None
-
-def demand_supply(highs, lows, direction):
-    rng = max(highs) - min(lows)
-    if direction=="LONG": return min(lows)+rng*0.15, min(lows)
-    return max(highs), max(highs)-rng*0.15
-
-def fib_check(price, zh, zl, direction):
-    rng = zh - zl
-    if rng<1e-9: return False, 0.0, "NONE"
-    ratio = (zh-price)/rng if direction=="LONG" else (price-zl)/rng
-    ratio = max(0.0, min(ratio, 1.0))
-    ok    = FIB_MIN <= ratio <= FIB_MAX
-    if ratio>=0.85:   zone="90% StopHunt 🎯"
-    elif ratio>=0.72: zone="78.6% DeepLiq 🔥"
-    elif ratio>=0.55: zone="61.8% Premium *"
-    else:             zone="50% Classique"
-    return ok, round(ratio*100,1), zone
-
-def imbalance_check(highs, lows, closes, direction):
-    n=min(30, len(highs)-2); price=closes[-1]; best=-1.0
-    for i in range(len(highs)-n, len(highs)-2):
-        if direction=="LONG":
-            gl, gh = highs[i], lows[i+2]
-            if gh<=gl: continue
-            total = gh-gl
-            fill  = max(0.0, min((gh-price)/total, 1.0)) if total>1e-9 else 0.0
-        else:
-            gh, gl = lows[i], highs[i+2]
-            if gl>=gh: continue
-            total = gh-gl
-            fill  = max(0.0, min((price-gl)/total, 1.0)) if total>1e-9 else 0.0
-        if fill>best: best=fill
-    return best>=IMBALANCE_MIN_FILL, round(best*100,1), best
-
-def detect_crt(opens, closes, highs, lows, direction):
-    if len(closes)<3: return False, "NONE"
-    o=opens[-1]; c=closes[-1]; h=highs[-1]; l=lows[-1]
-    o1=opens[-2]; c1=closes[-2]; h1=highs[-2]; l1=lows[-2]
-    rng=h-l; body=abs(c-o); body1=abs(c1-o1)
-    if rng<1e-9: return False, "NONE"
-    if body/rng>=CRT_BODY_RATIO:
-        if direction=="LONG"  and c>o: return True, "BougieForte↑"
-        if direction=="SHORT" and c<o: return True, "BougieForte↓"
-    lw=min(o,c)-l; uw=h-max(o,c)
-    if direction=="LONG"  and lw/rng>=CRT_WICK_RATIO: return True, "Hammer🔨"
-    if direction=="SHORT" and uw/rng>=CRT_WICK_RATIO: return True, "ShootingStar⭐"
-    if body1>1e-9 and body>body1*CRT_ENGULF_MULT:
-        if direction=="LONG"  and c>o and c>max(o1,c1): return True, "Engulfing↑"
-        if direction=="SHORT" and c<o and c<min(o1,c1): return True, "Engulfing↓"
-    tol=closes[-1]*CRT_TWEEZER_TOL
-    if direction=="LONG"  and abs(l-l1)<=tol and c>c1: return True, "TweezerBottom🟢"
-    if direction=="SHORT" and abs(h-h1)<=tol and c<c1: return True, "TweezerTop🔴"
-    if len(closes)>=3:
-        h2, l2=highs[-3], lows[-3]
-        inside=(h1<=h2*1.001) and (l1>=l2*0.999)
-        if inside:
-            if direction=="LONG"  and c>h1: return True, "InsideBreak↑"
-            if direction=="SHORT" and c<l1: return True, "InsideBreak↓"
-    return False, "NONE"
-
-def vol_regime(highs, lows, closes, n: int = ATR_PERIOD):
-    if len(highs)<n+1: return "NORMAL", 0.0, SCORE_THRESH["NORMAL"]
-    trs=[max(highs[i]-lows[i],
-             abs(highs[i]-closes[i-1]),
-             abs(lows[i]-closes[i-1])) for i in range(-n, 0)]
-    atr=sum(trs)/len(trs)
-    pct=atr/closes[-1] if closes[-1]>0 else 0
-    if pct<ATR_LOW_MULT:  return "LOW",    pct, SCORE_THRESH["LOW"]
-    if pct>ATR_HIGH_MULT: return "HIGH",   pct, SCORE_THRESH["HIGH"]
-    return "NORMAL", pct, SCORE_THRESH["NORMAL"]
-
-# ═══════════════════════════════════════════════════════════════
-#  🔍  v5.0 -- FILTRES QUALITÉ D'ENTRÉE (PRIORITÉ 1)
-# ═══════════════════════════════════════════════════════════════
-
-# [P1-B] Cache HTF bias M15 par symbole
-_htf_cache: Dict[str, dict] = {}
 
 def get_htf_bias(symbol: str) -> str:
-    """
-    [P1-B] Structure M15 du symbole : BULLISH / BEARISH / NEUTRAL.
-    Mise en cache HTF_CACHE_SEC secondes pour limiter les appels API.
-    Les trades ne seront autorisés QUE si la direction 1m aligne avec ce biais.
-    """
-    cached = _htf_cache.get(symbol, {})
-    if cached and (time.time() - cached.get("ts", 0)) < HTF_CACHE_SEC:
-        return cached["bias"]
-    raw = get_klines(symbol, "15m", 80)
-    if not isinstance(raw, list) or len(raw) < 30:
-        _htf_cache[symbol] = {"bias": "NEUTRAL", "ts": time.time()}
+    """Bias directionnel H4 via EMA50/EMA200 + position prix."""
+    candles = fetch_candles(symbol, "4h", bars=220)
+    if not candles or len(candles) < 205:
         return "NEUTRAL"
-    highs_htf = [float(x[2]) for x in raw]
-    lows_htf  = [float(x[3]) for x in raw]
-    bias = market_structure(highs_htf, lows_htf)
-    _htf_cache[symbol] = {"bias": bias, "ts": time.time()}
-    log(f"  HTF M15 {symbol}: {bias}", "INFO")
-    return bias
 
-# [P1-D] Cache BTC trend M15
-_btc_cache: dict = {"trend": "NEUTRAL", "ts": 0}
+    closes = [c["close"] for c in candles]
+    ema50  = compute_ema(closes, 50)
+    ema200 = compute_ema(closes, 200)
 
-def get_btc_trend() -> str:
-    """
-    [P1-D] Trend BTC M15 pour filtre corrélation.
-    Les altcoins ne vont pas LONG si BTC M15 BEARISH (et vice-versa).
-    Mise en cache BTC_CACHE_SEC secondes.
-    """
-    global _btc_cache
-    if time.time() - _btc_cache["ts"] < BTC_CACHE_SEC:
-        return _btc_cache["trend"]
-    raw = get_klines("BTCUSDT", "15m", 60)
-    if not isinstance(raw, list) or len(raw) < 30:
+    if not ema50 or not ema200:
         return "NEUTRAL"
-    highs_btc = [float(x[2]) for x in raw]
-    lows_btc  = [float(x[3]) for x in raw]
-    trend = market_structure(highs_btc, lows_btc)
-    _btc_cache = {"trend": trend, "ts": time.time()}
-    log(f"  BTC M15 trend: {trend}", "INFO")
-    return trend
 
-# [P1-C] Session filter
-def current_session_utc() -> str:
-    """
-    [P1-C] Session de trading basée sur l'heure UTC.
-    LONDON  : 07h-12h UTC
-    NY      : 12h-20h UTC
-    ASIA    : 00h-07h UTC  (range, manipulations fréquentes)
-    DEAD    : 20h-00h UTC  (faible liquidité, faux signaux)
-    """
-    h = datetime.utcnow().hour
-    if 7  <= h < 12: return "LONDON"
-    if 12 <= h < 20: return "NY"
-    if 0  <= h < 7:  return "ASIA"
-    return "DEAD"
+    price = closes[-1]
+    if price > ema50[-1] > ema200[-1]:
+        return "BULLISH"
+    if price < ema50[-1] < ema200[-1]:
+        return "BEARISH"
+    return "NEUTRAL"
 
-def session_allowed() -> bool:
-    """True uniquement pendant London et NY."""
-    sess = current_session_utc()
-    if sess in SESSION_WHITELIST: return True
-    if sess == "ASIA" and SESSION_ASIA_TRADE: return True
+
+def get_live_spread(symbol: str, candles_m1: Optional[List[Dict]] = None) -> float:
+    """
+    Spread live estimé en pips.
+    Si on a des bougies M1, utilise le range moyen des 3 dernières comme proxy.
+    Sinon retourne la valeur statique de SPREAD_PIPS.
+    """
+    static = SPREAD_PIPS.get(symbol, 3.0)
+    if not candles_m1 or len(candles_m1) < 3:
+        return static
+
+    pip = PIP_SIZE.get(symbol, 0.0001)
+    recent_ranges = [
+        (c["high"] - c["low"]) / pip
+        for c in candles_m1[-3:]
+    ]
+    avg_range = sum(recent_ranges) / len(recent_ranges)
+    # Proxy: spread ≈ 5% du range M1 pour les paires liquides
+    return max(static, avg_range * 0.05)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  SPREAD LIVE FILTER
+# ══════════════════════════════════════════════════════════════════════════
+
+def spread_is_toxic(symbol: str, spread_pips: float, atr_m15: float) -> bool:
+    """
+    Bloque si spread > 25% de l'ATR M15.
+    En pips : spread_price / atr_price.
+
+    Signale rollover, widening broker, ou liquidité toxique.
+    """
+    pip = PIP_SIZE.get(symbol, 0.0001)
+    spread_price = spread_pips * pip
+    if atr_m15 <= 0:
+        return False
+    ratio = spread_price / atr_m15
+    if ratio > 0.25:
+        log.info("  %s : SPREAD TOXIQUE — spread=%.2f pips ratio=%.2f ATR", symbol, spread_pips, ratio)
+        return True
     return False
 
-# [P1-E] Volatility spike (news / liquidation cascade)
-def is_vol_spike(highs: list, lows: list, atr: float) -> bool:
+
+# ══════════════════════════════════════════════════════════════════════════
+#  VOLUME INSTITUTIONNEL — Axe 1
+#  Volume relatif (anomalie) + Delta proxy directionnel
+# ══════════════════════════════════════════════════════════════════════════
+
+def compute_volume_profile(candles: List[Dict], lookback: int = 20) -> Dict:
     """
-    [P1-E] Détecte une bougie anormalement grande (news, liquidation BTC, etc.)
-    Si la dernière bougie dépasse SPIKE_ATR_MULT × ATR → on saute le cycle.
-    Évite les SL instantanés sur événements extrêmes.
+    Retourne un profil volume complet sur les N dernières bougies.
+
+    Champs retournés :
+        vol_ratio       — volume de la dernière bougie / moyenne N bougies
+        delta_ratio     — ratio volume haussier vs total (proxy delta)
+        absorption      — True si narrow-range + volume ×2 (absorption institutionnelle)
+        exhaustion      — True si wide-range + volume ×2 + bougie de clôture faible
+        vol_signal      — "STRONG_BUY" | "STRONG_SELL" | "ABSORPTION" | "EXHAUSTION" | "NEUTRAL"
+        institutional   — True si au moins un signal fort détecté
     """
-    if atr <= 0 or len(highs) < 2: return False
-    last_range = highs[-1] - lows[-1]
-    return last_range > atr * SPIKE_ATR_MULT
+    if not candles or len(candles) < lookback + 2:
+        return {"vol_signal": "NEUTRAL", "institutional": False,
+                "vol_ratio": 1.0, "delta_ratio": 0.5,
+                "absorption": False, "exhaustion": False}
 
-def get_signal(opens, highs, lows, closes, score_thresh: int,
-               atr: float = 0.0) -> Optional[dict]:
-    """
-    [v5.0] Signal SMC/CRT avec score rebalancé :
-      base          : 4  (structure + BOS/CHOCH validé)
-      imbalance     : +1
-      CRT           : +1  (était +2 → trop dominant)
-      displacement  : +1  (NEW — BOS avec impulsion réelle)
-      SCORE_MAX     : 7   (inchangé)
+    recent   = candles[-(lookback + 1):-1]   # N bougies historiques
+    last     = candles[-1]                    # bougie courante
+    last_vol = last.get("volume", 0)
 
-    Le filtre displacement est désormais DANS bos_choch() [P1-A].
-    Un BOS sans corps suffisant ne passe plus jamais.
-    """
-    if len(closes) < 55: return None
-    if atr <= 0:
-        atr = calc_atr(highs, lows, closes)
+    # ── Volume relatif ─────────────────────────────────────────────────────
+    avg_vol  = sum(c.get("volume", 0) for c in recent) / max(len(recent), 1)
+    vol_ratio = last_vol / avg_vol if avg_vol > 0 else 1.0
 
-    price     = closes[-1]
-    structure = market_structure(highs, lows)
-    if structure == "NEUTRAL": return None
+    # ── Delta proxy : pour chaque bougie, si close > open → volume haussier
+    bull_vol = sum(
+        c.get("volume", 0) for c in candles[-lookback:]
+        if c["close"] >= c["open"]
+    )
+    total_vol = sum(c.get("volume", 0) for c in candles[-lookback:])
+    delta_ratio = bull_vol / total_vol if total_vol > 0 else 0.5
 
-    bos = bos_choch(closes, highs, lows, opens, structure, atr)  # [P1-A]
-    br, _ = breakout_retest(highs, lows, closes)
-    direction = reason = None
+    # ── Absorption : bougie narrow-range + volume anormalement élevé
+    last_range   = last["high"] - last["low"]
+    atr_approx   = sum(
+        abs(candles[i]["high"] - candles[i]["low"])
+        for i in range(-min(14, len(candles)), -1)
+    ) / 14
+    absorption = (
+        last_range < 0.5 * atr_approx   # range étroit
+        and vol_ratio >= 1.8             # mais volume ×1.8
+    )
 
-    if   structure == "BULLISH" and bos in ("BOS_BULL", "CHOCH_BULL"):
-        direction, reason = "LONG",  bos
-    elif br == "BULL_RETEST":
-        direction, reason = "LONG",  "BullRetest"
-    elif structure == "BEARISH" and bos in ("BOS_BEAR", "CHOCH_BEAR"):
-        direction, reason = "SHORT", bos
-    elif br == "BEAR_RETEST":
-        direction, reason = "SHORT", "BearRetest"
-    if not direction: return None
+    # ── Exhaustion : wide-range + volume élevé + clôture au mauvais bout
+    body_ratio = abs(last["close"] - last["open"]) / max(last_range, 1e-10)
+    exhaustion = (
+        last_range > 1.5 * atr_approx   # bougie large
+        and vol_ratio >= 1.8             # volume élevé
+        and body_ratio < 0.35            # petite mèche fermée (rejet)
+    )
 
-    ob  = order_block(opens, closes, highs, lows, direction)
-    dz  = demand_supply(highs[-30:], lows[-30:], direction)
-    zh  = ob[0] if ob else dz[0]
-    zl  = ob[1] if ob else dz[1]
-    fib_ok, fib_pct, fib_zone = fib_check(price, zh, zl, direction)
-    if not fib_ok: return None
+    # ── Signal synthétique ─────────────────────────────────────────────────
+    if absorption:
+        sig = "ABSORPTION"
+    elif exhaustion:
+        sig = "EXHAUSTION"
+    elif vol_ratio >= 1.5 and delta_ratio >= 0.65:
+        sig = "STRONG_BUY"
+    elif vol_ratio >= 1.5 and delta_ratio <= 0.35:
+        sig = "STRONG_SELL"
+    else:
+        sig = "NEUTRAL"
 
-    # ── [P1-F] Score rebalance ────────────────────────────────
-    score = 4   # base : structure confirmee + BOS/retest
-
-    imb_ok, imb_fill, _ = imbalance_check(highs, lows, closes, direction)
-    if imb_ok: score += 1
-
-    crt_ok, crt_name = detect_crt(opens, closes, highs, lows, direction)
-    if crt_ok: score += 1   # etait +2 -- CRT seul ne suffit plus
-
-    # displacement bonus : BOS avec impulsion multi-bougies
-    if bos and bos in ("BOS_BULL", "BOS_BEAR", "CHOCH_BULL", "CHOCH_BEAR"):
-        # confirmation : 2 dernières bougies vont dans le même sens
-        if direction == "LONG"  and closes[-2] > opens[-2]: score += 1
-        if direction == "SHORT" and closes[-2] < opens[-2]: score += 1
-
-    if score < score_thresh: return None
-
-    sl_raw = (min(ob[1] if ob else dz[1], price * 0.9970) if direction == "LONG"
-              else max(ob[0] if ob else dz[0], price * 1.0030))
-    risk = abs(price - sl_raw)
-    if risk < 1e-9 or risk > price * 0.05: return None
-
-    tps = []
-    for tp_def in TP_SPLIT:
-        tp_price = (price + risk * tp_def["r"] if direction == "LONG"
-                    else price - risk * tp_def["r"])
-        tps.append({"r": tp_def["r"], "pct": tp_def["pct"],
-                    "price": tp_price, "hit": False})
+    institutional = sig in ("STRONG_BUY", "STRONG_SELL", "ABSORPTION", "EXHAUSTION")
 
     return {
-        "direction": direction, "entry": price, "sl_raw": sl_raw,
-        "tps": tps, "risk": risk, "fib_pct": fib_pct, "fib_zone": fib_zone,
-        "imb_fill": imb_fill if imb_ok else 0.0,
-        "crt_name": crt_name if crt_ok else "-",
-        "score": score, "reason": reason,
+        "vol_signal":    sig,
+        "institutional": institutional,
+        "vol_ratio":     round(vol_ratio, 2),
+        "delta_ratio":   round(delta_ratio, 3),
+        "absorption":    absorption,
+        "exhaustion":    exhaustion,
     }
 
-# ═══════════════════════════════════════════════════════════════
-#  📦  FETCH KLINES
-# ═══════════════════════════════════════════════════════════════
-def fetch_klines_parsed(symbol: str) -> Optional[tuple]:
-    raw = get_klines(symbol, "1m", KLINES_LIMIT)
-    if not isinstance(raw, list) or len(raw) < 60: return None
-    return (
-        [int(x[0])   for x in raw],
-        [float(x[1]) for x in raw],
-        [float(x[2]) for x in raw],
-        [float(x[3]) for x in raw],
-        [float(x[4]) for x in raw],
-    )
 
-# ═══════════════════════════════════════════════════════════════
-#  📒  JOURNAL CSV
-# ═══════════════════════════════════════════════════════════════
-JOURNAL_FILE = f"journal_v4_{datetime.now().strftime('%Y%m%d')}.csv"
-_HDR = ["time","symbol","direction","entry","sl","sl_source",
-        "tp1","tp2","tp3","qty","notional","margin","fees_est",
-        "risk_usd","risk_pct","score","crt","fib","reason",
-        "vol","ai_confidence","ai_verdict","ai_risk_adj","status"]
-
-def _jw(row):
-    hdr = not os.path.exists(JOURNAL_FILE)
-    with open(JOURNAL_FILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if hdr: w.writerow(_HDR)
-        w.writerow(row)
-
-def journal_open(t: dict, ss: "SessionState"):
-    fees = t["qty"] * t["entry"] * FEE_RATE * 2
-    _jw([datetime.now().isoformat(),
-         t["symbol"], t["direction"], t["entry"], t["sl"], t.get("sl_source",""),
-         t["tps"][0]["price"], t["tps"][1]["price"], t["tps"][2]["price"],
-         t["qty"], round(t["qty"]*t["entry"],2),
-         round(t["qty"]*t["entry"]/LEVERAGE,2), round(fees,4),
-         t["risk_usd"], t["risk_pct"], t["score"],
-         t["crt_name"], t["fib_zone"], t["reason"],
-         t.get("vol_regime",""),
-         t.get("ai_confidence","N/A"), t.get("ai_verdict","N/A"),
-         t.get("ai_risk_adj", 1.0), "OPEN"])
-
-def journal_close(t: dict, pnl: float, reason: str):
+def volume_confirms_direction(vol_profile: Dict, direction: str) -> bool:
     """
-    [v5.3] Journal enrichi avec close_reason structuré.
-    close_reason vocabulary :
-      SL_HARD       — SL Binance exchange déclenché
-      SL_MANUAL     — SL failover Python (latence API)
-      TP_PARTIAL    — Clôture partielle manuelle (R2)
-      TRAIL_STOP    — Trailing stop ATR déclenché
-      TIME_EXIT     — Sortie forcée > MAX_TRADE_HOURS
-      BE_EXIT       — Break-even touché
-      BINANCE_TP    — TP Binance exchange déclenché
-      BINANCE_CLOSED — Fermé côté exchange (raison indéterminée)
+    Vérifie si le volume institutionnel valide la direction du trade.
+
+    LONG  → STRONG_BUY ou ABSORPTION (acheteurs absorbent les vendeurs)
+    SHORT → STRONG_SELL ou EXHAUSTION (vendeurs dominent / rejet haussier)
     """
-    fees = t["qty"] * t["entry"] * FEE_RATE * 2
-    _jw([datetime.now().isoformat(),
-         t["symbol"], t["direction"], t["entry"], t["sl"], t.get("sl_source",""),
-         t["tps"][0]["price"], t["tps"][1]["price"], t["tps"][2]["price"],
-         t["qty"], round(t["qty"]*t["entry"],2),
-         round(t["qty"]*t["entry"]/LEVERAGE,2), round(fees,4),
-         t["risk_usd"], t["risk_pct"], t["score"],
-         t["crt_name"], t["fib_zone"], t["reason"],
-         t.get("vol_regime",""),
-         t.get("ai_confidence","N/A"), t.get("ai_verdict","N/A"),
-         t.get("ai_risk_adj", 1.0),
-         reason,                                   # <- close_reason structure v5.3
-         round(pnl, 4),                            # <- pnl colonne dediee
-         f"CLOSE|{reason}|PNL:{round(pnl,4)}"])   # <- compat retro
+    sig = vol_profile.get("vol_signal", "NEUTRAL")
+    dr  = vol_profile.get("delta_ratio", 0.5)
 
-def _infer_close_reason(trade: dict, pnl: float) -> str:
+    if direction == "LONG":
+        return sig in ("STRONG_BUY", "ABSORPTION") or dr >= 0.60
+    elif direction == "SHORT":
+        return sig in ("STRONG_SELL", "EXHAUSTION") or dr <= 0.40
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  LIQUIDITÉ RÉELLE — Axe 2
+#  Equal Highs / Equal Lows → BSL/SSL → Inducement zones
+#  Double confirmation : M15 + H4
+# ══════════════════════════════════════════════════════════════════════════
+
+def detect_liquidity_zones(candles: List[Dict], atr: float,
+                           tolerance_factor: float = 0.15) -> Dict:
     """
-    [v5.3] Déduit le close_reason à partir de l'état du trade.
-    Appelé quand Binance a fermé la position sans qu'on l'initie nous-mêmes.
+    Détecte les zones de liquidité réelles sur une série de bougies.
+
+    Equal highs = BSL (Buy-Side Liquidity) — stops des shorts
+    Equal lows  = SSL (Sell-Side Liquidity) — stops des longs
+
+    Retourne :
+        bsl_zones  — liste de niveaux BSL (equal highs)
+        ssl_zones  — liste de niveaux SSL (equal lows)
+        inducement — True si le prix a récemment sweeped un niveau
+        swept_bsl  — True si BSL sweeped sur la dernière bougie
+        swept_ssl  — True si SSL sweeped sur la dernière bougie
     """
-    if trade.get("close_reason"):
-        return trade["close_reason"]    # raison explicite dejà posee par le moteur
+    if not candles or len(candles) < 10 or atr <= 0:
+        return {"bsl_zones": [], "ssl_zones": [],
+                "inducement": False, "swept_bsl": False, "swept_ssl": False}
 
-    sl     = trade.get("sl", 0)
-    entry  = trade.get("entry", 0)
-    tps    = trade.get("tps", [])
-    direct = trade.get("direction", "LONG")
+    tol      = atr * tolerance_factor
+    highs    = [c["high"] for c in candles]
+    lows     = [c["low"]  for c in candles]
+    last_c   = candles[-1]
 
-    # BE touche
-    if trade.get("sl_source", "").startswith("BE_AUTO") and pnl <= 0:
-        return "BE_EXIT"
+    # ── Equal Highs (BSL) ──────────────────────────────────────────────────
+    bsl_zones: List[float] = []
+    for i in range(len(highs) - 2):
+        h = highs[i]
+        # Cherche un autre high dans la tolérance ATR, avant la bougie courante
+        matches = [
+            j for j in range(i + 2, len(highs) - 1)
+            if abs(highs[j] - h) <= tol
+        ]
+        if matches:
+            bsl_level = (h + highs[matches[-1]]) / 2
+            # Filtre doublons
+            if not any(abs(bsl_level - existing) <= tol for existing in bsl_zones):
+                bsl_zones.append(round(bsl_level, 8))
 
-    # TP touche : PnL positif et mark > TP1
-    if pnl > 0:
-        tp1_price = tps[0]["price"] if tps else 0
-        if (direct == "LONG"  and tp1_price > 0 and pnl > 0):
-            return "BINANCE_TP"
-        if (direct == "SHORT" and tp1_price > 0 and pnl > 0):
-            return "BINANCE_TP"
+    # ── Equal Lows (SSL) ───────────────────────────────────────────────────
+    ssl_zones: List[float] = []
+    for i in range(len(lows) - 2):
+        l = lows[i]
+        matches = [
+            j for j in range(i + 2, len(lows) - 1)
+            if abs(lows[j] - l) <= tol
+        ]
+        if matches:
+            ssl_level = (l + lows[matches[-1]]) / 2
+            if not any(abs(ssl_level - existing) <= tol for existing in ssl_zones):
+                ssl_zones.append(round(ssl_level, 8))
 
-    # SL touche
-    if pnl < 0:
-        return "SL_HARD"
+    # ── Sweep detection sur la dernière bougie ─────────────────────────────
+    swept_bsl = any(last_c["high"] > lvl > last_c["close"] for lvl in bsl_zones)
+    swept_ssl = any(last_c["low"]  < lvl < last_c["close"] for lvl in ssl_zones)
+    inducement = swept_bsl or swept_ssl
 
-    return "BINANCE_CLOSED"
-
-def _banner_close(sym: str, reason: str, pnl: float, direction: str):
-    """
-    [v5.3] Banner console coloré selon le type de clôture.
-    """
-    icons = {
-        "SL_HARD"       : f"{RED}🔴 SL_HARD{RST}",
-        "SL_MANUAL"     : f"{RED}🔴 SL_MANUAL{RST}",
-        "TP_PARTIAL"    : f"{GRN}🟡 TP_PARTIAL{RST}",
-        "TRAIL_STOP"    : f"{GRN}🟢 TRAIL_STOP{RST}",
-        "TIME_EXIT"     : f"{YEL}⏱️  TIME_EXIT{RST}",
-        "BE_EXIT"       : f"{CYN}🔒 BE_EXIT{RST}",
-        "BINANCE_TP"    : f"{GRN}🏆 BINANCE_TP{RST}",
-        "BINANCE_CLOSED": f"{YEL}📦 BINANCE_CLOSED{RST}",
-        "CLOSING_CONFIRMED": f"{CYN}[OK] CONFIRMED{RST}",
+    return {
+        "bsl_zones":  sorted(bsl_zones),
+        "ssl_zones":  sorted(ssl_zones),
+        "inducement": inducement,
+        "swept_bsl":  swept_bsl,
+        "swept_ssl":  swept_ssl,
     }
-    label = icons.get(reason, f"{YEL}❓ {reason}{RST}")
-    col   = grn if pnl >= 0 else red
-    print(
-        f"\n{sep('─')}\n"
-        f"  {bld(sym)}  {direction}  {label}\n"
-        f"  PnL : {col(f'${pnl:+.4f}')}\n"
-        f"{sep('─')}"
-    )
 
-# ═══════════════════════════════════════════════════════════════
-#  🎯  ORDER MANAGER v4 -- BUGS CORRIGÉS
-# ═══════════════════════════════════════════════════════════════
-def open_trade(symbol: str, sig: dict, ss: "SessionState",
-               atr: float, vol_regime_str: str,
-               highs: list = None, lows: list = None,
-               closes: list = None,
-               ai_result: dict = None) -> Optional[dict]:
+
+def detect_liquidity_double(
+    candles_m15: List[Dict], candles_h4: List[Dict],
+    atr_m15: float, atr_h4: float,
+) -> Dict:
     """
-    Place un trade avec tous les bugs v3.0 corrigés :
-      [OK] Bug #1 : SL recalculé sur real_entry avec structural_sl (pas dynamic_sl sur sl_raw)
-      [OK] Bug #2 : TP qty remaining recalculé APRÈS correction part_qty
-      [OK] Bug #3 : fallback balance avec log warn explicite
-      [OK] Bug #4 : sleep(0.5) après set_leverage avant ordre MARKET
+    Double confirmation M15 + H4.
+
+    Un sweep est significatif seulement s'il est confirmé sur les deux TF.
+    Retourne le résultat fusionné + un score de qualité liquidité (0–3).
     """
-    info = _sym_info.get(symbol)
-    if not info:
-        log(f"{symbol}: infos symbole absentes", "WARN"); return None
+    liq_m15 = detect_liquidity_zones(candles_m15, atr_m15)
+    liq_h4  = detect_liquidity_zones(candles_h4,  atr_h4)
 
-    direction  = sig["direction"]
-    entry      = sig["entry"]
-    entry_side = "BUY"  if direction == "LONG" else "SELL"
-    close_side = "SELL" if direction == "LONG" else "BUY"
+    # Score : 1 pt par TF pour inducement, +1 bonus si les deux confirment
+    score = 0
+    if liq_m15["inducement"]:
+        score += 1
+    if liq_h4["inducement"]:
+        score += 1
+    if liq_m15["inducement"] and liq_h4["inducement"]:
+        score += 1  # bonus double confirmation
 
-    # ── SL STRUCTUREL pre-sizing ──────────────────────────────
-    if highs and lows:
-        sl_presizing, _ = structural_sl(highs, lows, direction, entry, atr)
+    swept_bsl = liq_m15["swept_bsl"] or liq_h4["swept_bsl"]
+    swept_ssl = liq_m15["swept_ssl"] or liq_h4["swept_ssl"]
+
+    return {
+        "m15": liq_m15,
+        "h4":  liq_h4,
+        "liq_score":      score,          # 0–3
+        "swept_bsl":      swept_bsl,
+        "swept_ssl":      swept_ssl,
+        "inducement_any": liq_m15["inducement"] or liq_h4["inducement"],
+        "inducement_both": liq_m15["inducement"] and liq_h4["inducement"],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  AMD PHASE DETECTOR — Axe 3 (version refondée)
+#  Accumulation / Manipulation / Distribution
+#  Confirmation : structure BOS/CHoCH + volume + sweep de liquidité
+# ══════════════════════════════════════════════════════════════════════════
+
+def detect_amd_phase(
+    candles_h4: List[Dict],
+    candles_m15: List[Dict],
+    vol_profile: Optional[Dict] = None,
+    liq_data: Optional[Dict] = None,
+) -> str:
+    """
+    AMD propre avec confirmation structure + volume + liquidité.
+
+    ACCUMULATION  — range compressé, volume faible, pas de sweep
+    MANIPULATION  — sweep de liquidité confirmé + volume institutionnel
+    DISTRIBUTION  — expansion directionnelle post-sweep avec BOS
+
+    Priorité : MANIPULATION > DISTRIBUTION > ACCUMULATION
+    """
+    if not candles_h4 or len(candles_h4) < 20:
+        return "UNKNOWN"
+
+    atr_h4 = compute_atr(candles_h4, 14)
+    if atr_h4 <= 0:
+        return "UNKNOWN"
+
+    # ── Structure H4 : range des 10 dernières bougies ─────────────────────
+    h4_window = candles_h4[-10:]
+    highs_h4  = [c["high"] for c in h4_window]
+    lows_h4   = [c["low"]  for c in h4_window]
+    h4_range  = max(highs_h4) - min(lows_h4)
+    range_ratio = h4_range / (atr_h4 * 10) if atr_h4 > 0 else 1.0
+
+    # ── BOS M15 : la dernière bougie casse un high/low récent ─────────────
+    bos_bullish = bos_bearish = False
+    if candles_m15 and len(candles_m15) >= 10:
+        m15_window = candles_m15[-10:]
+        prev_high  = max(c["high"] for c in m15_window[:-1])
+        prev_low   = min(c["low"]  for c in m15_window[:-1])
+        last_m15   = candles_m15[-1]
+        bos_bullish = last_m15["close"] > prev_high
+        bos_bearish = last_m15["close"] < prev_low
+
+    bos_confirmed = bos_bullish or bos_bearish
+
+    # ── Volume institutionnel présent ? ───────────────────────────────────
+    vol_inst = vol_profile.get("institutional", False) if vol_profile else False
+
+    # ── Sweep de liquidité détecté ? ─────────────────────────────────────
+    sweep_detected = False
+    if liq_data:
+        sweep_detected = liq_data.get("swept_bsl", False) or liq_data.get("swept_ssl", False)
+
+    # ── Classification AMD ────────────────────────────────────────────────
+    # MANIPULATION : sweep + volume institutionnel
+    if sweep_detected and vol_inst:
+        return "MANIPULATION"
+
+    # DISTRIBUTION : BOS confirmé + range en expansion
+    if bos_confirmed and range_ratio >= 0.7:
+        return "DISTRIBUTION"
+
+    # ACCUMULATION : range compressé, pas de signal fort
+    if range_ratio < 0.6 and not sweep_detected:
+        return "ACCUMULATION"
+
+    # Par défaut : DISTRIBUTION si le range est suffisant
+    if range_ratio >= 0.6:
+        return "DISTRIBUTION"
+
+    return "ACCUMULATION"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  SIZING FIXE — Axe 4
+#  Risque fixe 50 USD par trade
+#  Lot = 50 / (distance_SL_pips × valeur_pip_USD)
+# ══════════════════════════════════════════════════════════════════════════
+
+# Valeur d'un pip en USD pour 1 lot standard (approximations stables)
+PIP_VALUE_USD: Dict[str, float] = {
+    "XAUUSD":  10.0,   # 1 lot = 100 oz → 0.1$ pip
+    "XAGUSD":   5.0,
+    "BTCUSDT":  1.0,   # varie, approx
+    "ETHUSDT":  0.10,
+    "EURUSD":  10.0,
+    "GBPUSD":  10.0,
+    "USDJPY":   9.0,   # approx USD/JPY
+    "AUDUSD":  10.0,
+    "USDCHF":  10.0,
+    "USDCAD":  10.0,
+    "GBPJPY":   9.0,
+    "NAS100":   1.0,   # par point index
+}
+
+
+def compute_fixed_lot(
+    symbol:      str,
+    entry:       float,
+    sl:          float,
+    risk_usd:    float = 50.0,
+) -> Dict:
+    """
+    Calcule le lot pour un risque fixe en USD.
+
+    Formule :
+        sl_pips   = |entry - sl| / pip_size
+        pip_val   = valeur d'un pip en USD pour 1 lot
+        lot       = risk_usd / (sl_pips × pip_val)
+
+    Retourne :
+        lot         — lot arrondi à 2 décimales (min 0.01)
+        sl_pips     — distance SL en pips
+        pip_val     — valeur pip USD utilisée
+        risk_usd    — risque effectif en USD
+    """
+    pip   = PIP_SIZE.get(symbol, 0.0001)
+    pv    = PIP_VALUE_USD.get(symbol, 10.0)
+
+    sl_distance = abs(entry - sl)
+    sl_pips     = sl_distance / pip if pip > 0 else 0
+
+    if sl_pips <= 0 or pv <= 0:
+        return {"lot": 0.01, "sl_pips": 0, "pip_val": pv, "risk_usd": risk_usd}
+
+    raw_lot   = risk_usd / (sl_pips * pv)
+    lot       = max(0.01, round(raw_lot, 2))
+
+    # Risque effectif recalculé avec le lot arrondi
+    effective_risk = lot * sl_pips * pv
+
+    return {
+        "lot":          lot,
+        "sl_pips":      round(sl_pips, 1),
+        "pip_val":      pv,
+        "risk_usd":     round(effective_risk, 2),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  UPGRADE 1 — TRADE QUALITY SCORE  (A+ / A / B / REJECT)
+#  Score institutionnel composite sur 10 points
+# ══════════════════════════════════════════════════════════════════════════
+
+SCORE_GRADES = {
+    "A+":     (9, 10),
+    "A":      (7,  9),
+    "B":      (5,  7),
+    "REJECT": (0,  5),
+}
+
+def compute_trade_quality(
+    vol_profile: Dict,
+    liq_data:    Dict,
+    amd:         str,
+    rr:          float,
+    session:     str,
+    regime:      str,    # TRENDING | RANGING | EXPANSION
+    displaced:   bool,   # False si fake displacement détecté
+    map_bonus:   float = 0.0,  # bonus liquidité map persistante (0.0–1.0)
+) -> Dict:
+    """
+    Score institutionnel composite sur 10 points.
+
+    Volume          → 0–2 pts
+    Liquidité       → 0–3 pts
+    AMD phase       → 0–2 pts
+    RR              → 0–1 pt
+    Session         → 0–1 pt
+    Régime          → 0–1 pt
+    Liq map bonus   → 0–1 pt  (niveaux matures non-sweepés)
+    Displacement    → malus −2 si fake
+
+    Retourne :
+        score     — float 0–10
+        grade     — "A+" | "A" | "B" | "REJECT"
+        breakdown — détail par critère
+    """
+    breakdown: Dict[str, float] = {}
+
+    # ── Volume (0–2) ───────────────────────────────────────────────────────
+    sig = vol_profile.get("vol_signal", "NEUTRAL")
+    dr  = vol_profile.get("delta_ratio", 0.5)
+    if sig in ("STRONG_BUY", "STRONG_SELL"):
+        vol_pts = 2.0
+    elif sig in ("ABSORPTION", "EXHAUSTION"):
+        vol_pts = 1.5
+    elif vol_profile.get("vol_ratio", 1.0) >= 1.3:
+        vol_pts = 1.0
     else:
-        sl_presizing, _ = dynamic_sl(entry, sig["sl_raw"], direction, atr)
-    sl_presizing = round_tick(sl_presizing, info["tickSize"])
+        vol_pts = 0.0
+    # Bonus delta fort
+    if dr >= 0.70 or dr <= 0.30:
+        vol_pts = min(vol_pts + 0.5, 2.0)
+    breakdown["volume"] = vol_pts
 
-    # ── Risk ajuste IA ─────────────────────────────────────────
-    score    = sig.get("score", 5)
-    risk_pct = ss.adaptive_risk_pct(score=score)
-    if ai_result:
-        risk_pct = min(risk_pct * ai_result.get("risk_adjustment", 1.0), RISK_MAX_CAP)
+    # ── Liquidité (0–3) ────────────────────────────────────────────────────
+    liq_pts = float(liq_data.get("liq_score", 0))   # déjà 0–3
+    breakdown["liquidity"] = liq_pts
 
-    # ── Sizing ────────────────────────────────────────────────
-    balance  = ss.current_balance
-    eff_lev  = get_effective_leverage(balance)
-    qty, notional, err = calc_position_size(
-        symbol, balance, risk_pct, entry, sl_presizing)
-    if err:
-        log(f"  {symbol} sizing refuse: {err}", "WARN"); return None
+    # ── AMD phase (0–2) ────────────────────────────────────────────────────
+    amd_pts = {"MANIPULATION": 2.0, "DISTRIBUTION": 1.0, "UNKNOWN": 0.0}.get(amd, 0.0)
+    breakdown["amd"] = amd_pts
 
-    risk_usd    = abs(entry - sl_presizing) / entry * notional
-    margin      = notional / eff_lev
-    sl_dist_pct = abs(entry - sl_presizing) / entry * 100
-
-    log(
-        f"  {symbol} {direction} | Entry~{entry:.6f} "
-        f"SL_pre={sl_presizing:.6f} dist={sl_dist_pct:.3f}% | "
-        f"Qty={fmt_qty(qty, info['stepSize'])} "
-        f"Not=${notional:.2f} Marge=${margin:.2f}({eff_lev}x) "
-        f"Risk={risk_pct*100:.1f}%(${risk_usd:.4f})",
-        "TRADE",
-    )
-
-    # ── 🔧 BUG #4 FIX : marge + levier avec sleep avant ordre ─
-    set_margin_isolated(symbol)
-    ok = set_leverage_api(symbol, eff_lev)
-    if not ok:
-        log(f"  {symbol}: levier {eff_lev}x non confirme -- retry", "WARN")
-        time.sleep(1.0)
-        set_leverage_api(symbol, eff_lev)
-    time.sleep(0.5)   # <- laisser Binance appliquer le levier avant l'ordre
-
-    # ── Entree MARKET avec retry lot ─────────────────────────
-    qty_str   = fmt_qty(qty, info["stepSize"])
-    entry_ord = None
-    _qty_attempt = qty
-
-    for _attempt in range(3):
-        _qty_str_try = fmt_qty(_qty_attempt, info["stepSize"])
-        entry_ord = place_order(symbol, entry_side, "MARKET", _qty_str_try)
-        if entry_ord and entry_ord.get("status") in ("FILLED", "NEW", "PARTIALLY_FILLED"):
-            qty     = _qty_attempt
-            qty_str = _qty_str_try
-            if _attempt > 0:
-                log(f"  {symbol}: lot ajuste -> {qty_str} ([OK] après {_attempt+1} essais)", "WARN")
-            break
-        err_msg = entry_ord.get("msg", "") if entry_ord else "timeout"
-        log(f"  {symbol}: ordre entree refusé (essai {_attempt+1}/3) -> {err_msg}", "WARN")
-        # Binance erreur -1111 (lot invalide) ou -2019 (marge insuffisante) :
-        # on réduit la qty de 20% et on réessaie
-        _qty_attempt = round_step(_qty_attempt * 0.80, info["stepSize"])
-        if _qty_attempt < info["minQty"]:
-            log(f"  {symbol}: qty {_qty_attempt} < minQty après réduction -> abandon", "WARN")
-            break
-        time.sleep(0.5)
-
-    if not entry_ord or entry_ord.get("status") not in (
-            "FILLED", "NEW", "PARTIALLY_FILLED"):
-        log(f"  {symbol}: ordre entree echoue apres 3 essais -> {entry_ord}", "ERROR")
-        return None
-
-    real_entry = float(entry_ord.get("avgPrice") or entry_ord.get("price") or entry)
-    if real_entry < 1e-9: real_entry = entry
-
-    # ── 🔧 BUG #1 FIX : SL recalcule sur real_entry avec structural_sl ──
-    # On NE reutilise PAS sig["sl_raw"] (trop serre) ni dynamic_sl.
-    # On recalcule structural_sl sur le vrai prix d'execution.
-    if highs and lows:
-        sl_final, sl_source = structural_sl(highs, lows, direction, real_entry, atr)
+    # ── RR (0–1) ───────────────────────────────────────────────────────────
+    if rr >= 3.0:
+        rr_pts = 1.0
+    elif rr >= 2.0:
+        rr_pts = 0.5
     else:
-        # Fallback ATR si pas de donnees OHLC (ne devrait pas arriver)
-        dist     = atr * SL_ATR_MIN_FACTOR
-        sl_final = real_entry - dist if direction == "LONG" else real_entry + dist
-        sl_source = "ATR_fallback"
+        rr_pts = 0.0
+    breakdown["rr"] = rr_pts
 
-    sl_final = round_tick(sl_final, info["tickSize"])
-    risk_actual = abs(real_entry - sl_final)
+    # ── Session (0–1) ──────────────────────────────────────────────────────
+    sess_pts = 1.0 if session in ("LONDON_OPEN", "NY_OPEN") else \
+               0.5 if session in ("LONDON", "LONDON_NY_OVERLAP", "NEW_YORK") else 0.0
+    breakdown["session"] = sess_pts
 
-    if risk_actual < 1e-9:
-        log(f"  {symbol}: risque nul après execution reelle", "WARN")
-        cancel_all_orders(symbol)
-        return None
+    # ── Régime (0–1) ───────────────────────────────────────────────────────
+    regime_pts = {"EXPANSION": 1.0, "TRENDING": 0.75, "RANGING": 0.25}.get(regime, 0.5)
+    breakdown["regime"] = regime_pts
 
-    # Securite : SL dans le mauvais sens -> annuler
-    if direction == "LONG" and sl_final >= real_entry:
-        log(f"  {symbol}: SL au-dessus du prix LONG -> annulation", "ERROR")
-        cancel_all_orders(symbol)
-        return None
-    if direction == "SHORT" and sl_final <= real_entry:
-        log(f"  {symbol}: SL en-dessous du prix SHORT -> annulation", "ERROR")
-        cancel_all_orders(symbol)
-        return None
+    # ── Liq map bonus (0–1) ────────────────────────────────────────────────
+    # Niveaux BSL/SSL matures (>24h) non-sweepés = cibles institutionnelles confirmées
+    breakdown["liq_map_bonus"] = round(min(map_bonus, 1.0), 2)
 
-    # ── SL : STOP_MARKET avec retry ──────────────────────────
-    sl_ord        = None
-    sl_order_id   = None
-    sl_binance_ok = False
+    # ── Malus fake displacement ────────────────────────────────────────────
+    disp_malus = 0.0 if displaced else -2.0
+    breakdown["displacement_malus"] = disp_malus
 
-    for _sl_try in range(3):
-        sl_ord = place_order(
-            symbol, close_side, "STOP_MARKET", qty_str,
-            stop_price=fmt_px(sl_final, info["tickSize"]),
-            reduce_only=True,
-        )
-        if sl_ord and sl_ord.get("orderId"):
-            sl_binance_ok = True
-            sl_order_id   = sl_ord.get("orderId")
+    raw   = sum(breakdown.values())
+    score = round(max(0.0, min(10.0, raw)), 2)
+
+    # Grade
+    grade = "REJECT"
+    for g, (lo, hi) in SCORE_GRADES.items():
+        if lo <= score < hi:
+            grade = g
             break
-        log(f"  {symbol}: SL Binance echec essai {_sl_try+1}/3 -> retry...", "WARN")
-        time.sleep(0.8)
+    if score >= 9:
+        grade = "A+"
 
-    if not sl_binance_ok:
-        # SL non posé sur Binance : on active le watchdog Python-side
-        # Le moniteur surveillera le prix et clôturera en MARKET si SL atteint
-        log(
-            f"  {symbol}: ⚠️ SL Binance non posé après 3 essais -- "
-            f"WATCHDOG PYTHON activé @ {sl_final:.6f}",
-            "WARN",
-        )
-        tg_send(
-            f"⚠️ <b>{symbol}</b> : SL Binance refusé !\n"
-            f"🛡️ <b>Watchdog Python activé</b> @ <code>{sl_final:.6f}</code>\n"
-            f"Le bot clôturera en MARKET si le prix atteint ce niveau."
-        )
+    return {"score": score, "grade": grade, "breakdown": breakdown}
 
-    # ── 🔧 BUG #2 FIX : TP qty avec remaining correct ─────────
-    tp_records = []
-    remaining  = qty
 
-    for i, tp_def in enumerate(TP_SPLIT):
-        tp_price_raw = (real_entry + risk_actual * tp_def["r"]
-                        if direction == "LONG"
-                        else real_entry - risk_actual * tp_def["r"])
-        tp_px_str = fmt_px(
-            round_tick(tp_price_raw, info["tickSize"]),
-            info["tickSize"],
-        )
+# ══════════════════════════════════════════════════════════════════════════
+#  UPGRADE 2 — FAKE DISPLACEMENT FILTER
+#  Large candle + faible delta → probable piège, pas vrai momentum
+#  Critique sur Gold / NAS100 (thin liquidity, spread expansion)
+# ══════════════════════════════════════════════════════════════════════════
 
-        if i < len(TP_SPLIT) - 1:
-            part_qty = round_step(qty * tp_def["pct"], info["stepSize"])
-            part_qty = max(part_qty, info["minQty"])   # clamp minQty
-            # <- BUG #2 FIX : on soustrait APRÈS avoir clampe part_qty
-            remaining = max(0.0, round_step(remaining - part_qty, info["stepSize"]))
-        else:
-            # Dernier TP = tout ce qui reste (jamais 0)
-            part_qty  = max(remaining, info["minQty"])
-            remaining = 0.0
+# Symboles à risque élevé de fake displacement
+FAKE_DISP_SENSITIVE = {"XAUUSD", "XAGUSD", "NAS100", "BTCUSDT", "GBPJPY"}
 
-        # ── TP avec retry + watchdog Python si Binance refuse ─
-        tp_ord        = None
-        tp_binance_ok = False
-        for _tp_try in range(3):
-            tp_ord = place_order(
-                symbol, close_side, "TAKE_PROFIT_MARKET",
-                fmt_qty(part_qty, info["stepSize"]),
-                stop_price=tp_px_str, reduce_only=True,
-            )
-            if tp_ord and tp_ord.get("orderId"):
-                tp_binance_ok = True
-                break
-            log(f"  {symbol}: TP{i+1} Binance echec essai {_tp_try+1}/3 -> retry...", "WARN")
-            time.sleep(0.6)
+def is_fake_displacement(
+    candles:     List[Dict],
+    vol_profile: Dict,
+    atr:         float,
+    symbol:      str,
+) -> bool:
+    """
+    Détecte un faux mouvement institutionnel.
 
-        if not tp_binance_ok:
-            log(
-                f"  {symbol}: ⚠️ TP{i+1} Binance non posé -- watchdog Python @ {tp_px_str}",
-                "WARN",
-            )
-            tg_send(
-                f"⚠️ <b>{symbol}</b> : TP{i+1} Binance refusé !\n"
-                f"🛡️ <b>Watchdog Python activé</b> @ <code>{tp_px_str}</code>\n"
-                f"Le bot clôturera partiellement en MARKET si le prix atteint ce niveau."
-            )
+    Un fake displacement combine :
+        1. Bougie large (range > 1.5×ATR)
+        2. Delta faible (delta_ratio 0.35–0.65 = pas de direction dominante)
+        3. Corps faible (body < 40% du range = rejet, pas continuation)
 
-        tp_records.append({
-            "r"            : tp_def["r"],
-            "pct"          : tp_def["pct"],
-            "price"        : float(tp_px_str),
-            "qty"          : part_qty,
-            "hit"          : False,
-            "order_id"     : tp_ord.get("orderId") if tp_ord else None,
-            "binance_ok"   : tp_binance_ok,   # False = watchdog Python actif
-        })
+    Optionnel : plus strict sur les symboles sensibles (Gold, NAS).
 
-    # ── Build trade object ────────────────────────────────────
-    ai_conf    = ai_result.get("confidence", "N/A")    if ai_result else "N/A"
-    ai_verdict = "CONFIRME"                             if ai_result and ai_result.get("confirmed") else "N/A"
-    ai_adj     = ai_result.get("risk_adjustment", 1.0) if ai_result else 1.0
+    Retourne True si c'est probablement un piège.
+    """
+    if not candles or atr <= 0:
+        return False
 
-    trade = {
-        "symbol"        : symbol,
-        "direction"     : direction,
-        "entry"         : real_entry,
-        "sl"            : sl_final,
-        "sl_source"     : sl_source,
-        "sl_order_id"   : sl_order_id,    # [P1-G] break-even
-        "sl_binance_ok" : sl_binance_ok,  # [v5.3.3] False = watchdog Python actif
-        "be_triggered"  : False,           # [P1-G] flag break-even
-        "closing"       : False,           # [v5.3] anti race-condition
-        "close_reason"  : None,            # [v5.3] close_reason structure
-        "qty"           : qty,
-        "tps"           : tp_records,
-        "score"         : sig["score"],
-        "crt_name"      : sig.get("crt_name", "-"),
-        "fib_zone"      : sig.get("fib_zone", "-"),
-        "reason"        : sig.get("reason", "-"),
-        "htf_bias"      : sig.get("htf_bias", "NEUTRAL"),   # [v5.3] BE adaptatif
-        "vol_regime"    : vol_regime_str,
-        "_atr_cache"    : atr,             # [v5.3] trailing stop live
-        "risk_usd"      : round(risk_usd, 4),
-        "risk_pct"      : risk_pct,
-        "open_time"     : time.time(),
-        "pnl"           : 0.0,
-        "ai_confidence" : ai_conf,
-        "ai_verdict"    : ai_verdict,
-        "ai_risk_adj"   : ai_adj,
-    }
+    last = candles[-1]
+    candle_range = last["high"] - last["low"]
+    body         = abs(last["close"] - last["open"])
+    body_ratio   = body / max(candle_range, 1e-10)
+    dr           = vol_profile.get("delta_ratio", 0.5)
+    vol_ratio    = vol_profile.get("vol_ratio", 1.0)
 
-    journal_open(trade, ss)
-    tg_trade_open(trade, ss)
-    return trade
+    # Condition de base : bougie large
+    if candle_range < 1.5 * atr:
+        return False   # bougie normale → pas de fake displacement
 
-# ═══════════════════════════════════════════════════════════════
-#  🔍  SURVEILLANCE POSITIONS
-# ═══════════════════════════════════════════════════════════════
-def is_position_open(symbol: str) -> Tuple[bool, float]:
-    positions = get_open_positions()
-    for p in positions:
-        if p["symbol"] == symbol:
-            return True, float(p.get("unRealizedProfit", 0))
-    return False, 0.0
+    # Delta ambigu = pas de camp dominant
+    delta_ambiguous = 0.35 <= dr <= 0.65
 
-def estimate_pnl(trade: dict) -> float:
+    # Corps faible = rejet / indécision
+    body_weak = body_ratio < 0.40
+
+    # Volume élevé + rejet = absorption (déjà traité) ou piège
+    high_vol_rejection = vol_ratio >= 1.5 and body_weak
+
+    # Symboles sensibles : seuil plus bas
+    if symbol in FAKE_DISP_SENSITIVE:
+        return delta_ambiguous or body_weak
+    else:
+        return delta_ambiguous and (body_weak or high_vol_rejection)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  UPGRADE 3 — LIQUIDITY MAP PERSISTANTE
+#  Mémoire des niveaux BSL/SSL par symbole, avec âge et statut sweep
+#  Un niveau H4 non-sweeped depuis 3 jours >> niveau récent
+# ══════════════════════════════════════════════════════════════════════════
+
+import json
+import pathlib
+
+_LIQ_MAP_PATH = pathlib.Path("alphabot_liq_map.json")
+
+# Structure en mémoire :
+# { symbol: { "bsl": [{level, tf, ts, swept}], "ssl": [...] } }
+_liq_map: Dict[str, Dict] = {}
+
+
+def _load_liq_map():
+    global _liq_map
+    if _LIQ_MAP_PATH.exists():
+        try:
+            _liq_map = json.loads(_LIQ_MAP_PATH.read_text())
+        except Exception:
+            _liq_map = {}
+
+
+def _save_liq_map():
     try:
-        mk = get_mark_price(trade["symbol"])
-        if not mk: return 0.0
-        mark = float(mk.get("markPrice", trade["entry"]))
-        if trade["direction"] == "LONG":
-            return (mark - trade["entry"]) * trade["qty"]
-        return (trade["entry"] - mark) * trade["qty"]
-    except Exception:
-        return 0.0
+        _LIQ_MAP_PATH.write_text(json.dumps(_liq_map, indent=2))
+    except Exception as e:
+        log.warning("Liquidity map save failed : %s", e)
 
-# ═══════════════════════════════════════════════════════════════
-#  🔄  GESTIONNAIRE DE POSITIONS
-# ═══════════════════════════════════════════════════════════════
-class LivePositionManager:
+
+def update_liq_map(symbol: str, liq_data: Dict, tf: str = "M15+H4"):
+    """
+    Met à jour la carte de liquidité persistante pour un symbole.
+
+    Ajoute les nouveaux niveaux BSL/SSL détectés.
+    Marque comme swept les niveaux qui ont été touchés.
+    Purge les niveaux de plus de 7 jours.
+    """
+    global _liq_map
+    now_ts  = time.time()
+    cutoff  = now_ts - 7 * 86400   # 7 jours
+
+    if symbol not in _liq_map:
+        _liq_map[symbol] = {"bsl": [], "ssl": []}
+
+    sym_map = _liq_map[symbol]
+
+    # ── Purge anciens niveaux ──────────────────────────────────────────────
+    sym_map["bsl"] = [z for z in sym_map["bsl"] if z["ts"] > cutoff]
+    sym_map["ssl"] = [z for z in sym_map["ssl"] if z["ts"] > cutoff]
+
+    # ── Ajouter nouveaux BSL ───────────────────────────────────────────────
+    existing_bsl = [z["level"] for z in sym_map["bsl"]]
+    for lvl in liq_data.get("m15", {}).get("bsl_zones", []) + \
+               liq_data.get("h4", {}).get("bsl_zones", []):
+        if not any(abs(lvl - e) < lvl * 0.001 for e in existing_bsl):
+            sym_map["bsl"].append({
+                "level": lvl, "tf": tf,
+                "ts": now_ts, "swept": False,
+                "age_h": 0,
+            })
+            existing_bsl.append(lvl)
+
+    # ── Ajouter nouveaux SSL ───────────────────────────────────────────────
+    existing_ssl = [z["level"] for z in sym_map["ssl"]]
+    for lvl in liq_data.get("m15", {}).get("ssl_zones", []) + \
+               liq_data.get("h4", {}).get("ssl_zones", []):
+        if not any(abs(lvl - e) < lvl * 0.001 for e in existing_ssl):
+            sym_map["ssl"].append({
+                "level": lvl, "tf": tf,
+                "ts": now_ts, "swept": False,
+                "age_h": 0,
+            })
+            existing_ssl.append(lvl)
+
+    # ── Marquer sweeps ─────────────────────────────────────────────────────
+    for zone in sym_map["bsl"]:
+        if liq_data.get("swept_bsl") and not zone["swept"]:
+            zone["swept"]  = True
+            zone["age_h"]  = round((now_ts - zone["ts"]) / 3600, 1)
+
+    for zone in sym_map["ssl"]:
+        if liq_data.get("swept_ssl") and not zone["swept"]:
+            zone["swept"]  = True
+            zone["age_h"]  = round((now_ts - zone["ts"]) / 3600, 1)
+
+    _save_liq_map()
+
+
+def get_liq_map_quality(symbol: str) -> Dict:
+    """
+    Retourne un score de qualité basé sur les niveaux persistants.
+
+    Un niveau non-sweeped depuis > 24h sur H4 = haute valeur.
+
+    Retourne :
+        old_bsl_count  — BSL anciens non-sweepés (> 24h)
+        old_ssl_count  — SSL anciens non-sweepés (> 24h)
+        map_bonus      — bonus score 0.0–1.0
+    """
+    sym_map  = _liq_map.get(symbol, {"bsl": [], "ssl": []})
+    now_ts   = time.time()
+    old_th   = 24 * 3600   # > 24h = niveau mature
+
+    old_bsl = sum(
+        1 for z in sym_map["bsl"]
+        if not z["swept"] and (now_ts - z["ts"]) > old_th
+    )
+    old_ssl = sum(
+        1 for z in sym_map["ssl"]
+        if not z["swept"] and (now_ts - z["ts"]) > old_th
+    )
+
+    # Bonus : plus il y a de niveaux matures non-sweepés, plus c'est intéressant
+    bonus = min((old_bsl + old_ssl) * 0.15, 1.0)
+
+    return {
+        "old_bsl_count": old_bsl,
+        "old_ssl_count": old_ssl,
+        "map_bonus":     round(bonus, 2),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  UPGRADE 4 — REGIME FILTER
+#  TRENDING / RANGING / EXPANSION
+#  Le régime conditionne l'efficacité AMD, FVG, et le score global
+# ══════════════════════════════════════════════════════════════════════════
+
+def detect_market_regime(candles_h4: List[Dict], atr_h4: float) -> str:
+    """
+    Détecte le régime de marché sur H4.
+
+    EXPANSION  — forte volatilité directionnelle (momentum réel)
+    TRENDING   — tendance claire mais volatilité normale
+    RANGING    — range compressé, pas de direction
+
+    Critères :
+        EMA20 vs EMA50    → direction
+        ATR ratio         → volatilité relative
+        HH/HL ou LH/LL   → structure de marché
+    """
+    if not candles_h4 or len(candles_h4) < 55:
+        return "RANGING"
+
+    closes = [c["close"] for c in candles_h4]
+    ema20  = compute_ema(closes, 20)
+    ema50  = compute_ema(closes, 50)
+
+    if not ema20 or not ema50:
+        return "RANGING"
+
+    # ── ATR ratio : ATR courant vs ATR moyen 50 bougies ───────────────────
+    atr_now = atr_h4
+    # ATR moyen sur les 50 dernières (proxy : range moyen)
+    recent_ranges = [
+        candles_h4[i]["high"] - candles_h4[i]["low"]
+        for i in range(-50, -1)
+    ]
+    atr_avg = sum(recent_ranges) / max(len(recent_ranges), 1)
+    atr_ratio = atr_now / atr_avg if atr_avg > 0 else 1.0
+
+    # ── Structure : HH/HL (bullish) ou LH/LL (bearish) ────────────────────
+    highs = [c["high"] for c in candles_h4[-10:]]
+    lows  = [c["low"]  for c in candles_h4[-10:]]
+
+    hh = highs[-1] > max(highs[:-1])   # Higher High
+    hl = lows[-1]  > min(lows[:-1])    # Higher Low
+    lh = highs[-1] < max(highs[:-1])   # Lower High
+    ll = lows[-1]  < min(lows[:-1])    # Lower Low
+
+    trending_bullish = hh and hl and ema20[-1] > ema50[-1]
+    trending_bearish = lh and ll and ema20[-1] < ema50[-1]
+    trending = trending_bullish or trending_bearish
+
+    # ── Classification ─────────────────────────────────────────────────────
+    if atr_ratio >= 1.4 and trending:
+        return "EXPANSION"    # volatilité élevée + structure directionnelle
+    elif trending:
+        return "TRENDING"     # structure directionnelle, volatilité normale
+    else:
+        return "RANGING"      # pas de structure claire
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  UPGRADE 5 — POST-TRADE ANALYTICS
+#  Journalisation JSON de chaque signal envoyé
+#  Base pour l'analyse statistique edge (WR par session, AMD, vol…)
+# ══════════════════════════════════════════════════════════════════════════
+
+_ANALYTICS_PATH = pathlib.Path("alphabot_analytics.jsonl")
+
+
+def log_trade_analytics(signal: Dict, grade: str, score: float, regime: str):
+    """
+    Enregistre chaque signal dans un fichier JSONL (une ligne = un trade).
+
+    Format conçu pour analyse pandas directe :
+        df = pd.read_json('alphabot_analytics.jsonl', lines=True)
+
+    Champs utiles pour analyse edge :
+        symbol, session, amd, vol_signal, liq_score,
+        regime, grade, score, rr, sl_pips, lot, risk_usd,
+        swept_bsl, swept_ssl, direction, htf_bias, timestamp
+    """
+    record = {
+        "timestamp":    signal["timestamp"].isoformat(),
+        "symbol":       signal["symbol"],
+        "tier":         signal["tier"],
+        "direction":    signal["direction"],
+        "session":      signal["session"],
+        "htf_bias":     signal["htf_bias"],
+        "amd":          signal["amd_phase"],
+        "vol_signal":   signal["vol_signal"],
+        "vol_ratio":    signal["vol_ratio"],
+        "delta_ratio":  signal["delta_ratio"],
+        "liq_score":    signal["liq_score"],
+        "swept_bsl":    signal["swept_bsl"],
+        "swept_ssl":    signal["swept_ssl"],
+        "regime":       regime,
+        "grade":        grade,
+        "score":        score,
+        "rr":           signal["rr"],
+        "sl_pips":      signal["sl_pips"],
+        "lot":          signal["lot"],
+        "risk_usd":     signal["risk_usd"],
+        "effective_entry": signal["effective_entry"],
+        "effective_sl":    signal["effective_sl"],
+        "tp":              signal["tp"],
+        # result à remplir manuellement ou via module de suivi futur
+        "result":       None,   # "WIN" | "LOSS" | "BE"
+        "pnl_usd":      None,
+    }
+    try:
+        with open(_ANALYTICS_PATH, "a") as f:
+            f.write(json.dumps(record) + "\n")
+        log.debug("Analytics logged : %s %s grade=%s score=%.1f",
+                  signal["symbol"], signal["direction"], grade, score)
+    except Exception as e:
+        log.warning("Analytics write failed : %s", e)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  CORRELATION EXPOSURE GUARD
+# ══════════════════════════════════════════════════════════════════════════
+
+class CorrelationGuard:
+    """
+    Maintient l'exposition active par groupe de corrélation.
+
+    FIX v4.2 : les positions sont maintenant horodatées et purgées
+    automatiquement après CORR_TTL_H heures, évitant le blocage
+    permanent des groupes en cas de non-appel à release().
+    """
+
+    CORR_TTL_H = 8   # durée de vie d'une position corrélée (heures)
+
     def __init__(self):
-        self.positions  : Dict[str, dict] = {}
-        self.last_close : Dict[str, float] = {}
+        # group_name → { symbol: registered_timestamp }
+        self._active: Dict[str, Dict[str, float]] = {g: {} for g in USD_CORR_GROUPS}
 
-    def count(self) -> int: return len(self.positions)
+    def _purge(self):
+        """Supprime les positions dont le TTL est dépassé."""
+        cutoff = time.time() - self.CORR_TTL_H * 3600
+        for group in self._active:
+            self._active[group] = {
+                sym: ts
+                for sym, ts in self._active[group].items()
+                if ts > cutoff
+            }
 
-    def can_open(self, symbol: str, ss: "SessionState") -> Tuple[bool, str]:
-        if self.count() >= MAX_POSITIONS:
-            return False, f"max {MAX_POSITIONS} positions"
-        if symbol in self.positions:
-            return False, "paire dejà ouverte"
-        elapsed = (time.time() - self.last_close.get(symbol, 0)) / 60
-        if elapsed < COOLDOWN_MIN:
-            return False, f"cooldown {round(COOLDOWN_MIN-elapsed,1)}min"
-        paused, reason = ss.check_pause()
-        if paused:
-            return False, f"pause: {reason}"
+    def can_add(self, symbol: str, direction: str) -> Tuple[bool, str]:
+        """Vérifie si ajouter ce symbole dépasse le cap de corrélation."""
+        self._purge()
+        for group, members in USD_CORR_GROUPS.items():
+            if symbol not in members:
+                continue
+            active = self._active[group]
+            if len(active) >= MAX_CORR_EXPOSURE and symbol not in active:
+                return False, f"Correlation cap groupe {group} ({len(active)}/{MAX_CORR_EXPOSURE})"
         return True, "OK"
 
-    def open(self, symbol: str, trade: dict):
-        self.positions[symbol] = trade
-
-    def close(self, symbol: str):
-        self.positions.pop(symbol, None)
-        self.last_close[symbol] = time.time()
-
-    def _try_breakeven(self, sym: str, trade: dict, upnl: float):
-        """
-        [v5.3] Break-even ADAPTATIF — 3 modes selon contexte.
-
-        Mode sélectionné à l'exécution :
-          • vol HIGH               → trigger = BE_FAST_R (0.3R)  — réactif
-          • vol NORMAL / LOW       → trigger = BE_TRIGGER_R (0.5R) — standard
-          • score=7 + HTF aligné   → fee_buf divisé par BE_TIGHT_BUF_MULT
-                                      (BE plus serré, protège plus de profit)
-
-        Anti race-condition : trade["closing"] bloque tout si clôture en cours.
-        """
-        if not BE_ENABLED: return
-        if trade.get("be_triggered"): return
-        if trade.get("closing"):      return   # anti race-condition v5.3
-
-        risk_usd = trade.get("risk_usd", 0)
-        if risk_usd <= 0: return
-
-        # ── Selection du trigger selon volatilite ─────────────
-        vol = trade.get("vol_regime", "NORMAL")
-        trigger_r = BE_FAST_R if vol == "HIGH" else BE_TRIGGER_R
-
-        if upnl < trigger_r * risk_usd: return
-
-        info = _sym_info.get(sym)
-        if not info: return
-
-        direction  = trade["direction"]
-        entry      = trade["entry"]
-        qty        = trade["qty"]
-        score      = trade.get("score", 5)
-        htf_bias   = trade.get("htf_bias", "NEUTRAL")
-        close_side = "SELL" if direction == "LONG" else "BUY"
-
-        # ── Fee buffer adaptatif ───────────────────────────────
-        # Score 7 + HTF aligne = setup sniper de haute qualite
-        # -> on resserre le BE pour verrouiller plus de profit
-        sniper_condition = (
-            score == 7 and
-            ((direction == "LONG"  and htf_bias == "BULLISH") or
-             (direction == "SHORT" and htf_bias == "BEARISH"))
-        )
-        fee_divisor = BE_TIGHT_BUF_MULT if sniper_condition else 1
-        fee_buf     = (entry * FEE_RATE * 6) / fee_divisor
-
-        be_price = (entry + fee_buf if direction == "LONG"
-                    else entry - fee_buf)
-        be_price = round_tick(be_price, info["tickSize"])
-
-        # ── Sanity check directionnel ──────────────────────────
-        if direction == "LONG"  and be_price <= entry:
-            log(f"  [BE] {sym}: be_price {be_price:.6f} <= entry -> annule", "WARN")
-            return
-        if direction == "SHORT" and be_price >= entry:
-            log(f"  [BE] {sym}: be_price {be_price:.6f} >= entry -> annule", "WARN")
-            return
-
-        mode_label = (
-            f"FAST({BE_FAST_R}R/vol HIGH)" if vol == "HIGH"
-            else f"SNIPER({trigger_r}R/buf/{fee_divisor})" if sniper_condition
-            else f"STD({trigger_r}R)"
-        )
-        log(
-            f"  [BE] {sym}: uPnL=${upnl:.4f} >= {trigger_r}R "
-            f"[{mode_label}] -> move SL -> {be_price:.6f}",
-            "TRADE",
-        )
-
-        # ── Annulation SL existant + replacement ──────────────
-        cancel_all_orders(sym)
-        time.sleep(0.3)
-
-        qty_str = fmt_qty(qty, info["stepSize"])
-        be_ord  = place_order(
-            sym, close_side, "STOP_MARKET", qty_str,
-            stop_price=fmt_px(be_price, info["tickSize"]),
-            reduce_only=True,
-        )
-
-        if be_ord:
-            trade["sl"]           = be_price
-            trade["sl_source"]    = f"BE_AUTO_{mode_label}"
-            trade["sl_order_id"]  = be_ord.get("orderId")
-            trade["be_triggered"] = True
-            log(f"  [BE] {sym}: [OK] SL -> {be_price:.6f} [{mode_label}]", "TRADE")
-            tg_send(
-                f"🔒 <b>Break-Even AUTO -- {sym}</b>\n"
-                f"Mode     : <code>{mode_label}</code>\n"
-                f"SL deplace -> <code>{be_price:.6f}</code>\n"
-                f"uPnL : +${upnl:.4f}  [{direction}]"
-            )
-        else:
-            log(f"  [BE] {sym}: ❌ Ordre BE echoue", "WARN")
-
-    # ═══════════════════════════════════════════════════════════
-    #  🚪  v5.3 -- STRATEGIC EXIT ENGINE
-    # ═══════════════════════════════════════════════════════════
-
-    def _close_at_sl(self, sym: str, trade: dict) -> bool:
-        """
-        SL_MANUAL — Clôture manuelle au marché si Binance SL lag/échoue.
-        Appelé quand mark < sl (LONG) ou mark > sl (SHORT) sans fermeture auto.
-        Anti race-condition : trade["closing"] empêche double exécution.
-        """
-        if trade.get("closing"): return False
-        info = _sym_info.get(sym)
-        if not info: return False
-
-        direction  = trade["direction"]
-        close_side = "SELL" if direction == "LONG" else "BUY"
-        qty_str    = fmt_qty(trade["qty"], info["stepSize"])
-
-        log(f"  [SL_MAN] {sym}: clôture manuelle SL failover", "WARN")
-        trade["closing"] = True
-        cancel_all_orders(sym)
-        time.sleep(0.2)
-
-        ord_ = place_order(sym, close_side, "MARKET", qty_str, reduce_only=True)
-        if ord_:
-            log(f"  [SL_MAN] {sym}: [OK] ordre MARKET envoye", "TRADE")
-            return True
-        else:
-            trade["closing"] = False   # reset si echec pour retry au prochain cycle
-            log(f"  [SL_MAN] {sym}: ❌ ordre echoue", "ERROR")
-            return False
-
-    def _close_partial(self, sym: str, trade: dict,
-                       pct: float, reason: str) -> bool:
-        """
-        TP_PARTIAL — Sortie partielle manuelle (Python-side).
-        Utilisé si TP2 Binance non touché après 2R atteint côté mark.
-        pct = fraction de la qty totale à fermer (ex: 0.30 pour 30%).
-        Anti race-condition : skip si closing en cours.
-        """
-        if trade.get("closing"): return False
-        if trade.get(f"partial_{reason}_done"): return False
-        info = _sym_info.get(sym)
-        if not info: return False
-
-        direction  = trade["direction"]
-        close_side = "SELL" if direction == "LONG" else "BUY"
-        part_qty   = round_step(trade["qty"] * pct, info["stepSize"])
-        part_qty   = max(part_qty, info["minQty"])
-        qty_str    = fmt_qty(part_qty, info["stepSize"])
-
-        log(f"  [PARTIAL] {sym}: fermeture {pct*100:.0f}% qty={qty_str} [{reason}]", "TRADE")
-        ord_ = place_order(sym, close_side, "MARKET", qty_str, reduce_only=True)
-        if ord_:
-            trade[f"partial_{reason}_done"] = True
-            log(f"  [PARTIAL] {sym}: [OK] {pct*100:.0f}% ferme", "TRADE")
-            tg_send(
-                f"📤 <b>Clôture Partielle -- {sym}</b>\n"
-                f"Raison : <code>{reason}</code>\n"
-                f"Qty    : <code>{qty_str}</code>  ({pct*100:.0f}%  [{direction}])"
-            )
-            return True
-        log(f"  [PARTIAL] {sym}: ❌ ordre partiel echoue", "WARN")
-        return False
-
-    def _close_trail(self, sym: str, trade: dict,
-                     mark: float, atr: float) -> bool:
-        """
-        TRAIL_STOP — Trailing stop ATR après TRAIL_R_START×R de profit.
-        SL = mark ± ATR × TRAIL_ATR_MULT  (mark-based, robuste vs micro-spikes).
-        Ne place PAS d'ordre Binance supplémentaire : déplace le SL en mémoire
-        et annule/replace le STOP_MARKET Binance.
-        Anti race-condition : trade["closing"] bloque si clôture en cours.
-        """
-        if CLOSE_MODE == "BINANCE_ONLY": return False
-        if trade.get("closing"):         return False
-
-        direction = trade["direction"]
-        entry     = trade["entry"]
-        risk_usd  = trade.get("risk_usd", 0)
-        if risk_usd <= 0 or atr <= 0: return False
-
-        # Calcul du profit actuel en R
-        r_dist = abs(entry - trade["sl"])
-        if r_dist <= 0: return False
-        current_r = (mark - entry) / r_dist if direction == "LONG" else (entry - mark) / r_dist
-        if current_r < TRAIL_R_START: return False
-
-        # Nouveau SL trail
-        new_sl = (mark - atr * TRAIL_ATR_MULT if direction == "LONG"
-                  else mark + atr * TRAIL_ATR_MULT)
-
-        info = _sym_info.get(sym)
-        if not info: return False
-        new_sl = round_tick(new_sl, info["tickSize"])
-
-        # On ne deplace le SL que si c'est FAVORABLE (jamais reculer)
-        if direction == "LONG"  and new_sl <= trade["sl"]: return False
-        if direction == "SHORT" and new_sl >= trade["sl"]: return False
-
-        log(
-            f"  [TRAIL] {sym}: {current_r:.2f}R >= {TRAIL_R_START}R "
-            f"-> SL {trade['sl']:.6f} -> {new_sl:.6f}  (ATRx{TRAIL_ATR_MULT})",
-            "TRADE",
-        )
-
-        close_side = "SELL" if direction == "LONG" else "BUY"
-        qty_str    = fmt_qty(trade["qty"], info["stepSize"])
-
-        cancel_all_orders(sym)
-        time.sleep(0.2)
-        ord_ = place_order(
-            sym, close_side, "STOP_MARKET", qty_str,
-            stop_price=fmt_px(new_sl, info["tickSize"]),
-            reduce_only=True,
-        )
-        if ord_:
-            old_sl = trade["sl"]
-            trade["sl"]         = new_sl
-            trade["sl_source"]  = f"TRAIL_{current_r:.1f}R"
-            trade["sl_order_id"] = ord_.get("orderId")
-            log(f"  [TRAIL] {sym}: [OK] SL {old_sl:.6f} -> {new_sl:.6f}", "TRADE")
-            tg_send(
-                f"🎯 <b>Trailing Stop -- {sym}</b>\n"
-                f"Profit : <code>{current_r:.2f}R</code>\n"
-                f"SL deplace -> <code>{new_sl:.6f}</code>  [{direction}]"
-            )
-            return True
-        else:
-            log(f"  [TRAIL] {sym}: ❌ ordre trailing echoue", "WARN")
-            return False
-
-    def _close_time_exit(self, sym: str, trade: dict) -> bool:
-        """
-        TIME_EXIT — Sortie forcée si trade bloqué > MAX_TRADE_HOURS.
-        Évite les positions zombies qui immobilisent du capital inutilement.
-        Anti race-condition : trade["closing"] bloque si clôture en cours.
-        """
-        if CLOSE_MODE == "BINANCE_ONLY": return False
-        if trade.get("closing"):         return False
-
-        elapsed_h = (time.time() - trade.get("open_time", time.time())) / 3600
-        if elapsed_h < MAX_TRADE_HOURS: return False
-
-        info = _sym_info.get(sym)
-        if not info: return False
-
-        direction  = trade["direction"]
-        close_side = "SELL" if direction == "LONG" else "BUY"
-        qty_str    = fmt_qty(trade["qty"], info["stepSize"])
-        upnl       = estimate_pnl(trade)
-
-        log(
-            f"  [TIME_EXIT] {sym}: {elapsed_h:.1f}h >= {MAX_TRADE_HOURS}h "
-            f"uPnL=${upnl:.4f} -> sortie forcee",
-            "WARN",
-        )
-        trade["closing"] = True
-        cancel_all_orders(sym)
-        time.sleep(0.2)
-
-        ord_ = place_order(sym, close_side, "MARKET", qty_str, reduce_only=True)
-        if ord_:
-            log(f"  [TIME_EXIT] {sym}: [OK] sortie forcee envoyee", "TRADE")
-            tg_send(
-                f"⏱️ <b>Time Exit -- {sym}</b>\n"
-                f"Duree  : <code>{elapsed_h:.1f}h</code>  (max {MAX_TRADE_HOURS}h)\n"
-                f"uPnL   : <code>${upnl:.4f}</code>  [{direction}]"
-            )
-            return True
-        else:
-            trade["closing"] = False
-            log(f"  [TIME_EXIT] {sym}: ❌ ordre echoue", "ERROR")
-            return False
-
-    def _handle_strategic_exits(self, sym: str, trade: dict,
-                                 mark: float, upnl: float, atr: float) -> bool:
-        """
-        Orchestrateur des sorties stratégiques v5.3.
-        Appelé depuis monitor_all() pour chaque position OUVERTE.
-
-        Pipeline :
-          1. SL failover  — si mark franchit SL et position encore ouverte
-          2. Partial R2   — si mark ≥ TP2 et PARTIAL_CLOSE_R2 activé
-          3. Trailing     — si profit ≥ TRAIL_R_START × R
-          4. Time exit    — si trade vieux > MAX_TRADE_HOURS
-
-        Retourne True si une clôture complète a été initiée (→ to_close).
-        """
-        if trade.get("closing"): return False
-
-        direction = trade["direction"]
-        sl        = trade["sl"]
-        entry     = trade["entry"]
-        risk_dist = abs(entry - sl)
-
-        # ── 1. SL failover ────────────────────────────────────
-        sl_breached = (
-            (direction == "LONG"  and mark <= sl) or
-            (direction == "SHORT" and mark >= sl)
-        )
-        if sl_breached:
-            log(f"  [EXIT] {sym}: mark {mark:.6f} franchit SL {sl:.6f} -> failover", "WARN")
-            closed = self._close_at_sl(sym, trade)
-            if closed:
-                return True   # sera retire de positions dans monitor_all
-
-        # ── 1b. Watchdog TP Python (si Binance a refusé le TP) ──
-        # Pour chaque TP dont binance_ok=False, on surveille le prix
-        # et on clôture en MARKET si atteint
-        if CLOSE_MODE != "BINANCE_ONLY":
-            for _tp in trade.get("tps", []):
-                if _tp.get("hit"):        continue
-                if _tp.get("binance_ok", True): continue  # Binance gère
-                tp_price = _tp["price"]
-                tp_hit = (
-                    (direction == "LONG"  and mark >= tp_price) or
-                    (direction == "SHORT" and mark <= tp_price)
-                )
-                if tp_hit:
-                    _tp_label = f"R{_tp['r']}"
-                    log(
-                        f"  [WATCHDOG_TP] {sym}: mark {mark:.6f} atteint TP "
-                        f"{tp_price:.6f} ({_tp_label}) -> clôture Python",
-                        "TRADE",
-                    )
-                    _tp["hit"] = True
-                    ok = self._close_partial(
-                        sym, trade,
-                        pct=_tp["pct"],
-                        reason=f"WATCHDOG_TP_{_tp_label}",
-                    )
-                    if ok:
-                        tg_send(
-                            f"🎯 <b>Watchdog TP {_tp_label} -- {sym}</b>\n"
-                            f"Mark  : <code>{mark:.6f}</code>\n"
-                            f"TP    : <code>{tp_price:.6f}</code>\n"
-                            f"Qty   : {_tp['pct']*100:.0f}%  [{direction}]"
-                        )
-
-        # ── 2. Partial close à 2R ─────────────────────────────
-        if PARTIAL_CLOSE_R2 and risk_dist > 0 and CLOSE_MODE != "BINANCE_ONLY":
-            r2_price = (entry + risk_dist * 2.0 if direction == "LONG"
-                        else entry - risk_dist * 2.0)
-            r2_hit = (
-                (direction == "LONG"  and mark >= r2_price) or
-                (direction == "SHORT" and mark <= r2_price)
-            )
-            if r2_hit:
-                self._close_partial(sym, trade, pct=0.30, reason="R2_PARTIAL")
-
-        # ── 3. Trailing stop ──────────────────────────────────
-        if CLOSE_MODE in ("STRATEGIC", "HYBRID") and atr > 0:
-            self._close_trail(sym, trade, mark, atr)
-
-        # ── 4. Time exit ──────────────────────────────────────
-        closed = self._close_time_exit(sym, trade)
-        if closed:
-            return True
-
-        return False
-
-    # ═══════════════════════════════════════════════════════════
-    #  🔄  MONITOR_ALL v5.3 -- orchestrateur leger
-    # ═══════════════════════════════════════════════════════════
-    def monitor_all(self, ss: "SessionState"):
-        """
-        [v5.3] Orchestrateur de surveillance — logique métier externalisée.
-
-        Pipeline par position :
-          [1] Sync état exchange (position ouverte ou non)
-          [2] Break-even adaptatif
-          [3] Sorties stratégiques (SL failover / partials / trailing / time)
-          [4] Cleanup des positions fermées + stats session
-        """
-        to_close: List[Tuple[str, float, str]] = []
-
-        for sym, trade in list(self.positions.items()):
-            if trade.get("closing"):
-                # Position dejà en cours de fermeture -- on attend confirmation
-                open_, upnl = is_position_open(sym)
-                if not open_:
-                    pnl = estimate_pnl(trade)
-                    to_close.append((sym, pnl, trade.get("close_reason", "CLOSING_CONFIRMED")))
-                continue
-
-            open_, upnl = is_position_open(sym)
-
-            if not open_:
-                # ── Position fermee côte Binance (TP/SL exchange) ──
-                pnl    = estimate_pnl(trade)
-                reason = _infer_close_reason(trade, pnl)
-                to_close.append((sym, pnl, reason))
-                result = "WIN" if pnl >= 0 else "LOSS"
-                log(
-                    f"{sym} CLÔTURÉ [{reason}] | PnL~${pnl:.4f} | {result}",
-                    "TRADE",
-                )
-            else:
-                # ── Position ouverte -- surveillance active ──────────
-                col = grn if upnl >= 0 else red
-                dur = round((time.time() - trade.get("open_time", time.time())) / 60, 1)
-                log(f"  {sym} OPEN | uPnL: {col(f'${upnl:.4f}')} | {dur}min", "INFO")
-
-                # ATR courant pour trailing (best-effort -- 0 si fetch impossible)
-                atr_live = trade.get("_atr_cache", 0.0)
-
-                # [1] Break-even adaptatif
-                self._try_breakeven(sym, trade, upnl)
-
-                # [2] Sorties strategiques
-                if CLOSE_MODE != "BINANCE_ONLY":
-                    mark_data = get_mark_price(sym)
-                    mark = float(mark_data.get("markPrice", 0)) if mark_data else 0.0
-                    if mark > 0:
-                        force_close = self._handle_strategic_exits(
-                            sym, trade, mark, upnl, atr_live)
-                        if force_close:
-                            pnl    = estimate_pnl(trade)
-                            reason = trade.get("close_reason", "SL_MANUAL")
-                            to_close.append((sym, pnl, reason))
-
-        # ── Cleanup + mise à jour session ───────────────────────
-        for sym, pnl, reason in to_close:
-            trade = self.positions.get(sym, {})
-            if not trade:
-                continue
-
-            journal_close(trade, pnl, reason)
-            _banner_close(sym, reason, pnl, trade.get("direction", ""))
-            r_dist    = abs(trade.get("entry", 0) - trade.get("sl", 0))
-            r_real    = round(abs(pnl) / (r_dist * trade.get("qty", 1)), 2) if r_dist > 0 else 0
-            direction = trade.get("direction", "")
-
-            if pnl >= 0:
-                ss.record_win(pnl, direction=direction, rr=r_real)
-            else:
-                ss.record_loss(pnl, direction=direction, rr=-r_real)
-
-            # Refresh balance avec fallback (bug #3 v4)
-            new_bal = get_balance_usdt()
-            if new_bal > 0:
-                ss.current_balance = new_bal
-            else:
-                log("⚠️  Balance API indisponible -- fallback PnL approximatif", "WARN")
-                ss.current_balance = max(0.0, ss.current_balance + pnl)
-
-            tg_trade_close(trade, pnl, reason, ss)
-
-            paused, reason_p = ss.check_pause()
-            if paused and ss.consecutive_sl >= MAX_CONSEC_SL:
-                log(f"⏸️  PAUSE -- {reason_p}", "PAUSE")
-                tg_pause(reason_p, ss)
-
-            self.close(sym)
-
-    def reconcile(self):
-        for p in get_open_positions():
-            sym = p["symbol"]
-            if sym in SYMBOLS and sym not in self.positions:
-                d  = "LONG" if float(p.get("positionAmt", 0)) > 0 else "SHORT"
-                ep = float(p.get("entryPrice", 0))
-                log(f"Position externe {sym} {d} @ {ep}", "WARN")
-                tg_send(f"⚠️ Position {sym} {d} @ {ep} detectee hors bot. Gestion manuelle.")
-
-# ═══════════════════════════════════════════════════════════════
-#  🔭  SCANNER MULTI-MARCHÉS v4.0
-# ═══════════════════════════════════════════════════════════════
-def scan_and_rank_symbols(pm: LivePositionManager,
-                          ss: SessionState) -> List[dict]:
-    results : List[dict] = []
-    skipped : List[dict] = []
-
-    log(f"🔭 Scan {len(SYMBOLS)} marches...", "INFO")
-
-    # ── [P1-C] Session filter -- verification globale ──────────
-    sess = current_session_utc()
-    if not session_allowed():
-        log(f"  ⛔ Session {sess} bloquee (hors London/NY) -- scan annule", "WARN")
-        tg_send(f"⏸️ Session <b>{sess}</b> bloquee -- AlphaBot v5 attend London/NY.")
-        return []
-
-    log(f"  [OK] Session {sess} autorisee", "INFO")
-
-    # ── [P1-D] BTC trend -- recupere une seule fois pour tout le scan
-    btc_trend = get_btc_trend() if BTC_CORR_ENABLED else "NEUTRAL"
-    log(f"  📡 BTC M15 trend: {btc_trend}", "INFO")
-
-    for symbol in SYMBOLS:
-        can, reason = pm.can_open(symbol, ss)
-        if not can:
-            skipped.append({"symbol": symbol, "skip_reason": reason})
-            continue
-
-        data = fetch_klines_parsed(symbol)
-        if not data:
-            skipped.append({"symbol": symbol, "skip_reason": "fetch echoue"})
-            continue
-
-        _, opens, highs, lows, closes = data
-        regime, atr_pct, thresh = vol_regime(highs, lows, closes)
-        atr = calc_atr(highs, lows, closes)
-
-        # ── [P1-E] Volatility spike (news/liquidation) ────────
-        if is_vol_spike(highs, lows, atr):
-            skipped.append({"symbol": symbol,
-                            "skip_reason": f"vol spike >3.5xATR (news?)"})
-            log(f"  ⚡ {symbol}: spike detecte -> skip", "WARN")
-            continue
-
-        if regime == "HIGH" and ss.consecutive_sl > 0:
-            skipped.append({"symbol": symbol,
-                            "skip_reason": f"vol HIGH + {ss.consecutive_sl} SL recent"})
-            continue
-
-        sig = get_signal(opens, highs, lows, closes, thresh, atr=atr)
-        if not sig:
-            skipped.append({"symbol": symbol,
-                            "skip_reason": f"pas de signal [{regime}]"})
-            continue
-
-        direction = sig["direction"]
-
-        # ── [P1-B] HTF M15 bias -- alignement obligatoire ──────
-        if HTF_GATE_ENABLED:
-            htf = get_htf_bias(symbol)
-            htf_ok = (
-                (direction == "LONG"  and htf == "BULLISH") or
-                (direction == "SHORT" and htf == "BEARISH") or
-                htf == "NEUTRAL"   # NEUTRAL = pas de filtre
-            )
-            if not htf_ok:
-                skipped.append({"symbol": symbol,
-                                "skip_reason": f"HTF M15 {htf} ≠ {direction}"})
-                log(f"  🚫 {symbol}: HTF {htf} contre {direction} -> rejet", "WARN")
-                continue
-            sig["htf_bias"] = htf
-        else:
-            sig["htf_bias"] = "N/A"
-
-        # ── [P1-D] BTC correlation gate ───────────────────────
-        if BTC_CORR_ENABLED and symbol != "BTCUSDT":
-            btc_block = (
-                (direction == "LONG"  and btc_trend == "BEARISH") or
-                (direction == "SHORT" and btc_trend == "BULLISH")
-            )
-            if btc_block:
-                skipped.append({"symbol": symbol,
-                                "skip_reason": f"BTC M15 {btc_trend} ≠ {direction}"})
-                log(f"  🚫 {symbol}: BTC {btc_trend} bloque {direction} -> rejet", "WARN")
-                continue
-
-        results.append({
-            "symbol" : symbol,
-            "sig"    : sig,
-            "atr"    : atr,
-            "regime" : regime,
-            "score"  : sig["score"],
-            "highs"  : highs,
-            "lows"   : lows,
-            "closes" : closes,
-            "session": sess,
-            "btc_trend": btc_trend,
-        })
-
-        log(
-            f"  [OK] {symbol:12s} {sig['direction']:5s} "
-            f"Score:{sig['score']}/{SCORE_MAX} "
-            f"HTF:{sig.get('htf_bias','?'):8s} "
-            f"CRT:{sig['crt_name']:15s} "
-            f"Fib:{sig['fib_zone']:20s} [{regime}]",
-            "TRADE",
-        )
-        time.sleep(0.3)
-
-    log(
-        f"  Resultat scan : {len(results)} signal(s) sur {len(SYMBOLS)} "
-        f"({len(skipped)} ignores)",
-        "INFO",
+    def register(self, symbol: str):
+        self._purge()
+        for group, members in USD_CORR_GROUPS.items():
+            if symbol in members:
+                self._active[group][symbol] = time.time()
+
+    def release(self, symbol: str):
+        """Libération manuelle anticipée (optionnelle — TTL prend le relais)."""
+        for group in self._active.values():
+            group.pop(symbol, None)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  SIGNAL TRACKER (daily cap + cooldown par symbole + anti-duplicate)
+# ══════════════════════════════════════════════════════════════════════════
+
+class SignalTracker:
+    """
+    Gère :
+        - Compteur journalier (reset à minuit UTC)
+        - Gap global minimum entre signaux
+        - Cooldown par symbole (2h)
+        - Hash anti-duplicate (TTL 6h)
+    """
+
+    def __init__(self):
+        self.count_today        = 0
+        self.last_signal_ts:   Optional[datetime.datetime] = None
+        self.symbol_last_ts:   Dict[str, datetime.datetime] = {}
+        self.sent_hashes:      Dict[str, datetime.datetime] = {}
+        self._current_day      = datetime.date.today()
+
+    def _daily_reset(self):
+        today = datetime.date.today()
+        if today != self._current_day:
+            log.info("Nouveau jour — reset compteurs (%d signaux envoyés hier)", self.count_today)
+            self.count_today   = 0
+            self._current_day  = today
+
+    def _purge_old_hashes(self):
+        cutoff = datetime.datetime.utcnow() - datetime.timedelta(hours=SETUP_HASH_TTL_H)
+        expired = [h for h, ts in self.sent_hashes.items() if ts < cutoff]
+        for h in expired:
+            del self.sent_hashes[h]
+
+    def make_setup_hash(self, symbol: str, direction: str,
+                        entry: float, sl: float, tp: float) -> str:
+        """Hash stable sur les paramètres clés d'un setup."""
+        raw = f"{symbol}_{direction}_{entry:.4f}_{sl:.4f}_{tp:.4f}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def can_send(self, symbol: str, setup_hash: str) -> Tuple[bool, str]:
+        self._daily_reset()
+        self._purge_old_hashes()
+        now = datetime.datetime.utcnow()
+
+        if self.count_today >= MAX_SIGNALS_PER_DAY:
+            return False, f"Cap journalier ({MAX_SIGNALS_PER_DAY}/jour)"
+
+        if self.last_signal_ts:
+            gap_min = (now - self.last_signal_ts).total_seconds() / 60
+            if gap_min < MIN_GAP_GLOBAL_MIN:
+                return False, f"Gap global trop court ({gap_min:.0f}min < {MIN_GAP_GLOBAL_MIN}min)"
+
+        if symbol in self.symbol_last_ts:
+            sym_gap_h = (now - self.symbol_last_ts[symbol]).total_seconds() / 3600
+            if sym_gap_h < SYMBOL_COOLDOWN_H:
+                return False, f"{symbol} cooldown ({sym_gap_h:.1f}h < {SYMBOL_COOLDOWN_H}h)"
+
+        if setup_hash in self.sent_hashes:
+            return False, f"Setup déjà envoyé (hash {setup_hash})"
+
+        return True, "OK"
+
+    def record(self, symbol: str, setup_hash: str):
+        now = datetime.datetime.utcnow()
+        self.count_today        += 1
+        self.last_signal_ts      = now
+        self.symbol_last_ts[symbol] = now
+        self.sent_hashes[setup_hash] = now
+        log.info("Signal #%d envoyé — %s | hash %s", self.count_today, symbol, setup_hash)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  SIGNAL PIPELINE
+# ══════════════════════════════════════════════════════════════════════════
+
+def run_signal_pipeline(
+    symbol:    str,
+    session:   str,
+    news_risk: str,
+    htf_bias:  str,
+    tier:      int,
+) -> Optional[Dict]:
+    """
+    Pipeline complet pour un symbole — v3.0 (4 axes refondus).
+
+    Axes actifs :
+        1. Volume institutionnel (relatif + delta proxy)
+        2. Liquidité réelle (BSL/SSL equal H/L, sweep, M15+H4)
+        3. AMD propre (sweep + BOS + volume)
+        4. Sizing fixe 50 USD
+
+    Retourne un dict signal ou None si le setup est invalide / filtré.
+    """
+    log.info("  Scanning %s (Tier %d) bias=%s session=%s", symbol, tier, htf_bias, session)
+
+    # ── Session filter ─────────────────────────────────────────────────────
+    if tier == 3 and not session_allows_tier3(session):
+        return None
+    if tier == 3 and htf_bias == "NEUTRAL":
+        return None
+
+    # ── News hard block ────────────────────────────────────────────────────
+    if news_hard_block(symbol, news_risk):
+        return None
+
+    # ── Fetch candles ──────────────────────────────────────────────────────
+    h4_candles  = fetch_candles(symbol, "4h",  bars=220)
+    m15_candles = fetch_candles(symbol, "15m", bars=150)
+
+    if not h4_candles or not m15_candles:
+        log.warning("  %s : données insuffisantes", symbol)
+        return None
+
+    # ── ATR ────────────────────────────────────────────────────────────────
+    atr_m15 = compute_atr(m15_candles, 14)
+    atr_h4  = compute_atr(h4_candles,  14)
+    if atr_m15 <= 0 or atr_h4 <= 0:
+        return None
+
+    # ── Spread live filter ─────────────────────────────────────────────────
+    spread_pips = get_live_spread(symbol)
+    if spread_is_toxic(symbol, spread_pips, atr_m15):
+        return None
+
+    # ══ AXE 1 : Volume institutionnel ═════════════════════════════════════
+    vol_profile = compute_volume_profile(m15_candles, lookback=20)
+    log.debug(
+        "  %s Vol: signal=%s ratio=%.2f delta=%.3f inst=%s",
+        symbol, vol_profile["vol_signal"], vol_profile["vol_ratio"],
+        vol_profile["delta_ratio"], vol_profile["institutional"],
     )
 
-    results.sort(key=lambda x: x["score"], reverse=True)
-    top_n = results[:TOP_N_SYMBOLS]
-
-    if top_n:
-        log("  🏆 Classement :", "INFO")
-        for i, r in enumerate(top_n, 1):
-            log(
-                f"    #{i} {r['symbol']:12s} Score:{r['score']} "
-                f"HTF:{r['sig'].get('htf_bias','?')} "
-                f"[{r['regime']}] {r['sig']['direction']}",
-                "INFO",
-            )
-
-    return top_n
-
-
-def tg_scan_summary(ranked: List[dict], total: int):
-    if not ranked:
-        tg_send(
-            f"🔭 <b>Scan multi-marches</b> -- {total} paires\n"
-            f"<i>Aucun signal valide ce cycle.</i>"
-        )
-        return
-    lines = ""
-    for i, r in enumerate(ranked):
-        sig    = r["sig"]
-        entry  = sig["entry"]
-        sl_raw = sig["sl_raw"]
-        sl_pct = round(abs(entry - sl_raw) / entry * 100, 3)
-        tp1    = sig["tps"][0]["price"] if sig["tps"] else 0
-        rr1    = round(abs(tp1 - entry) / abs(entry - sl_raw), 2) if abs(entry - sl_raw) > 0 else 0
-        lines += (
-            f"\n#{i+1} <b>{r['symbol']}</b> -- {sig['direction']} "
-            f"Score:<b>{r['score']}/{SCORE_MAX}</b> [{r['regime']}]\n"
-            f"   Entree: <code>{entry:.5f}</code>  SL: ({sl_pct}%)\n"
-            f"   TP1: <code>{tp1:.5f}</code>  R:R~1:{rr1}  {sig['fib_zone']}\n"
-        )
-    tg_send(
-        f"🔭 <b>Scan {total} marches -- {len(ranked)} signal(s)</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━"
-        f"{lines}"
+    # ══ AXE 2 : Liquidité BSL/SSL double TF ═══════════════════════════════
+    liq_data = detect_liquidity_double(m15_candles, h4_candles, atr_m15, atr_h4)
+    log.debug(
+        "  %s Liq: score=%d swept_bsl=%s swept_ssl=%s",
+        symbol, liq_data["liq_score"],
+        liq_data["swept_bsl"], liq_data["swept_ssl"],
     )
 
-# ═══════════════════════════════════════════════════════════════
-#  📊  DASHBOARD CONSOLE
-# ═══════════════════════════════════════════════════════════════
-def print_dashboard(pm: LivePositionManager, ss: SessionState, cycle: int):
-    now      = datetime.now().strftime("%H:%M:%S")
-    risk_pct = ss.adaptive_risk_pct(score=5) * 100
-    pnl_col  = grn if ss.session_pnl >= 0 else red
-    paused, pause_reason = ss.check_pause()
-    pause_str = f" | {mag('PAUSE: '+pause_reason[:30])}" if paused else ""
-    ai_str    = f" | IA[OK]{ss.ai_confirmed}/❌{ss.ai_rejected}"
+    # ── Upgrade 3 : Liquidity map persistante ─────────────────────────────
+    update_liq_map(symbol, liq_data)
+    liq_map_quality = get_liq_map_quality(symbol)
 
-    print(f"\n{sep('═')}")
-    print(
-        f"  {cyn(bld(f'CYCLE #{cycle}  {now}'))}  "
-        f"Pos:{yel(str(pm.count()))}/{MAX_POSITIONS}  "
-        f"Balance:{grn(f'${ss.current_balance:.2f}')}  "
-        f"PnL:{pnl_col(f'${ss.session_pnl:+.4f}')}  "
-        f"WR:{yel(f'{ss.win_rate}%')}"
-        f"{ai_str}{pause_str}"
-    )
-    print(sep('═'))
+    # ── Upgrade 4 : Regime filter ──────────────────────────────────────────
+    regime = detect_market_regime(h4_candles, atr_h4)
+    log.debug("  %s Regime: %s", symbol, regime)
 
-    if pm.positions:
-        print(f"  {yel('POSITIONS ACTIVES :')}")
-        for sym, t in pm.positions.items():
-            mk_data = get_mark_price(sym)
-            mark    = float(mk_data.get("markPrice", t["entry"])) if mk_data else t["entry"]
-            upnl    = ((mark-t["entry"])*t["qty"] if t["direction"]=="LONG"
-                       else (t["entry"]-mark)*t["qty"])
-            col     = grn if upnl>=0 else red
-            dur     = round((time.time()-t.get("open_time",time.time()))/60, 1)
-            print(
-                f"  [{yel(sym)}] {t['direction']}  "
-                f"Entry:{t['entry']:.6f}  Mark:{mark:.6f}  "
-                f"SL:{t['sl']:.6f}[{t.get('sl_source','-')}]  "
-                f"uPnL:{col(f'${upnl:.4f}')}  "
-                f"IA:{t.get('ai_confidence','?')}%  {dur}min"
-            )
+    # Ranging : on n'entre pas en AMD sans expansion — trop de faux signaux
+    if regime == "RANGING" and not liq_data["inducement_both"]:
+        log.debug("  %s : RANGING sans double inducement — skip", symbol)
+        return None
 
-# ═══════════════════════════════════════════════════════════════
-#  🚀  BOUCLE PRINCIPALE
-# ═══════════════════════════════════════════════════════════════
-def main():
-    print(cyn(bld("""
-╔═══════════════════════════════════════════════════════════════╗
-║   ALPHABOT FUTURES v5.3.4 -- ANTI-BAN + WATCHDOG            ║
-║   21 marches | HTF M15 | BTC corr | Session | BE auto       ║
-╚═══════════════════════════════════════════════════════════════╝""")))
-    log("🚀 main() démarré -- initialisation en cours...", "INFO")
+    # ══ AXE 3 : AMD propre ════════════════════════════════════════════════
+    amd = detect_amd_phase(h4_candles, m15_candles, vol_profile, liq_data)
+    if amd == "ACCUMULATION":
+        log.debug("  %s : ACCUMULATION — attente", symbol)
+        return None
 
-    if not API_KEY or "COLLE" in (API_KEY or ""):
-        log("⛔ API_KEY non renseignee.", "ERROR")
-        log("   export BINANCE_KEY='ta_cle'", "ERROR")
-        log("   export BINANCE_SECRET='ton_secret'", "ERROR")
-        log("   export ANTHROPIC_API_KEY='ta_cle_anthropic'", "ERROR")
-        return
+    # ── Prix actuel ────────────────────────────────────────────────────────
+    entry_price = m15_candles[-1]["close"]
 
-    # Anti-ban Binance : delais entre appels au demarrage
-    # Chaque restart trop rapide flood IP -> ban 418
-    log("Demarrage dans 30s (anti-ban Binance -- protection IP)...", "INFO")
-    time.sleep(30)
-
-    log("⏱️  Synchronisation horloge Binance...", "INFO")
-    sync_server_time()
-    time.sleep(1)
-
-    log("📡 Chargement exchange info...", "INFO")
-    if not load_symbol_info(): return
-    time.sleep(2)
-
-    log("💰 Récupération balance USDT...", "INFO")
-
-    balance = get_balance_usdt()
-    if balance <= 0:
-        log("Balance USDT = 0 ou cle API invalide.", "ERROR"); return
-    if balance < MIN_BALANCE_USD:
-        log(f"Balance ${balance:.2f} < seuil ${MIN_BALANCE_USD}.", "ERROR"); return
-
-    log(f"💰 Balance: ${balance:.2f} USDT", "INFO")
-
-    ss = SessionState(start_balance=balance)
-    ss.current_balance = balance
-
-    tg_check()
-    tg_startup(ss)
-
-    # Test agent IA au demarrage
-    if AI_ENABLED and ANTHROPIC_API_KEY not in ("COLLE_TA_CLE_ANTHROPIC", "", None):
-        log("🤖 Test agent IA Anthropic...", "AI")
-        # Test leger : juste verifier que la cle est valide
-        try:
-            test_data = json.dumps({
-                "model": ANTHROPIC_MODEL,
-                "max_tokens": 10,
-                "messages": [{"role": "user", "content": "Reponds juste: OK"}],
-            }).encode()
-            req = urlreq.Request(
-                "https://api.anthropic.com/v1/messages", data=test_data,
-                headers={"Content-Type": "application/json",
-                         "x-api-key": ANTHROPIC_API_KEY,
-                         "anthropic-version": "2023-06-01"},
-                method="POST",
-            )
-            with urlreq.urlopen(req, timeout=15) as r:
-                json.loads(r.read())
-            log("🤖 Agent IA Anthropic : [OK] OK", "AI")
-            tg_send("🤖 <b>Agent IA Anthropic</b> : [OK] Connecte et operationnel")
-        except Exception as e:
-            log(f"🤖 Agent IA : ❌ {e}", "WARN")
-            tg_send(f"⚠️ Agent IA Anthropic : erreur connexion ({e})\nBot continue sans IA.")
-    else:
-        log("🤖 Agent IA desactive ou cle absente -- mode sans validation IA", "WARN")
-
-    pm         = LivePositionManager()
-    pm.reconcile()
-    cycle      = 0
-    was_paused = False
-
-    while True:
-        cycle += 1
-
-        bal = get_balance_usdt()
-        if bal > 0:
-            ss.current_balance = bal
-
-        print_dashboard(pm, ss, cycle)
-
-        if ss.current_balance < MIN_BALANCE_USD:
-            log(f"⛔ Balance ${ss.current_balance:.2f} < ${MIN_BALANCE_USD}.", "ERROR")
-            tg_send(f"⛔ Balance trop faible (${ss.current_balance:.4f}). Bot arrête.")
-            break
-
-        paused, pause_reason = ss.check_pause()
-        if paused:
-            if not was_paused:
-                log(f"⏸️  PAUSE: {pause_reason}", "PAUSE")
-            was_paused = True
-            log(f"  En pause ({pause_reason}). Surveillance...", "PAUSE")
-            if pm.positions:
-                pm.monitor_all(ss)
-            time.sleep(SCAN_INTERVAL_SEC)
-            continue
-        else:
-            if was_paused:
-                log("▶️  Reprise du bot", "INFO")
-                tg_resume(ss)
-                was_paused = False
-
-        # ── Surveiller positions ──────────────────────────────
-        if pm.positions:
-            pm.monitor_all(ss)
-            bal = get_balance_usdt()
-            if bal > 0: ss.current_balance = bal
-
-        # ── Scan + ranking ───────────────────────────────────
-        max_pos = adaptive_max_positions(ss.current_balance)
-        if pm.count() < max_pos:
-            ranked = scan_and_rank_symbols(pm, ss)
-
-            if cycle - ss.last_summary_cycle >= TG_SUMMARY_CYCLES:
-                tg_scan_summary(ranked, len(SYMBOLS))
-                tg_hourly_summary(ss, pm.positions)
-                ss.last_summary_cycle = cycle
-
-            sniper_ok, sniper_reason = ss.sniper_can_trade()
-            if not sniper_ok:
-                log(f"  🎯 Sniper: {sniper_reason} -> attente", "INFO")
-            else:
-                if SNIPER_MODE:
-                    ranked = [r for r in ranked if r["score"] >= SNIPER_MIN_SCORE]
-
-                for candidate in ranked:
-                    if pm.count() >= max_pos:
-                        break
-
-                    symbol = candidate["symbol"]
-                    sig    = candidate["sig"]
-                    atr    = candidate["atr"]
-                    regime = candidate["regime"]
-                    highs  = candidate.get("highs")
-                    lows   = candidate.get("lows")
-                    closes = candidate.get("closes")
-
-                    can, reason = pm.can_open(symbol, ss)
-                    if not can:
-                        log(f"  {symbol}: skip ({reason})", "INFO")
-                        continue
-
-                    # ── 🤖 VALIDATION AGENT IA ────────────────
-                    ai_result = None
-                    if AI_ENABLED:
-                        log(f"  🤖 Agent IA -> validation {symbol}...", "AI")
-                        ai_result = _ai_verifier.verify(
-                            symbol, sig, highs or [], lows or [],
-                            closes or [], regime, ss,
-                            btc_trend=candidate.get("btc_trend", "NEUTRAL"),
-                        )
-                        tg_ai_verdict(symbol, sig, ai_result)
-
-                        if not ai_result["confirmed"]:
-                            ss.ai_rejected += 1
-                            log(
-                                f"  🤖 IA REJETTE {symbol} -- "
-                                f"confiance {ai_result['confidence']}% "
-                                f"(< {AI_MIN_CONFIDENCE}%) : {ai_result['reasoning']}",
-                                "AI",
-                            )
-                            continue
-
-                        ss.ai_confirmed += 1
-                        log(
-                            f"  🤖 IA CONFIRME {symbol} -- "
-                            f"{ai_result['confidence']}% confiance "
-                            f"riskx{ai_result['risk_adjustment']:.1f}",
-                            "AI",
-                        )
-
-                    log(
-                        f"  {symbol}: TRADE {sig['direction']} "
-                        f"Score:{sig['score']}/{SCORE_MAX} "
-                        f"CRT:{sig['crt_name']} Fib:{sig['fib_zone']} [{regime}]",
-                        "TRADE",
-                    )
-
-                    trade = open_trade(
-                        symbol, sig, ss, atr, regime,
-                        highs=highs, lows=lows, closes=closes,
-                        ai_result=ai_result,
-                    )
-                    if trade:
-                        pm.open(symbol, trade)
-                        # 🔧 BUG #3 FIX : refresh avec fallback dejà dans open_trade
-                        bal = get_balance_usdt()
-                        if bal > 0:
-                            ss.current_balance = bal
-                        else:
-                            log("⚠️  Balance API indisponible après trade -- fallback", "WARN")
-                        ss.sniper_record_trade()
-                        log(f"  [OK] {symbol}: ouvert. Balance: ${ss.current_balance:.2f}", "TRADE")
-                    else:
-                        log(f"  ❌ {symbol}: ouverture echouee", "WARN")
-
-                    time.sleep(2)
-                    if SNIPER_MODE:
-                        break
-
-        else:
-            log(f"Max positions ({max_pos}) atteint. Surveillance uniquement.", "INFO")
-            if cycle - ss.last_summary_cycle >= TG_SUMMARY_CYCLES:
-                tg_hourly_summary(ss, pm.positions)
-                ss.last_summary_cycle = cycle
-
-        log(f"Prochain cycle dans {SCAN_INTERVAL_SEC}s...", "INFO")
-        time.sleep(SCAN_INTERVAL_SEC)
-
-
-# ═══════════════════════════════════════════════════════════════
-#  🌐  FLASK KEEPALIVE
-# ═══════════════════════════════════════════════════════════════
-import threading
-
-try:
-    from flask import Flask, jsonify
-    _flask_ok = True
-except ImportError:
-    _flask_ok = False
-
-if _flask_ok:
-    _app        = Flask(__name__)
-    _bot_status = {"running": False, "cycle": 0, "started_at": None}
-
-    @_app.route("/")
-    def index():
-        return jsonify({
-            "bot"       : "AlphaBot Futures v5.0",
-            "status"    : "running" if _bot_status["running"] else "stopped",
-            "started_at": _bot_status["started_at"],
-            "symbols"   : len(SYMBOLS),
-            "top_n"     : TOP_N_SYMBOLS,
-            "ai_enabled": AI_ENABLED,
-        })
-
-    @_app.route("/health")
-    def health():
-        return "OK", 200
-
-    def _run_flask():
-        port = int(os.environ.get("PORT", 8080))
-        log(f"🌐 Flask keepalive sur port {port}", "INFO")
-        _app.run(host="0.0.0.0", port=port, use_reloader=False)
-
-# ═══════════════════════════════════════════════════════════════
-if __name__ == "__main__":
-    if _flask_ok:
-        t = threading.Thread(target=_run_flask, daemon=True)
-        t.start()
-        _bot_status["started_at"] = datetime.now().isoformat()
-        _bot_status["running"]    = True
-        # ── FIX RENDER : laisser Flask binder le port et passer le health-check
-        # avant de lancer main() qui fait des appels réseau longs (Binance, Anthropic).
-        # Sans ce sleep, Render peut redéployer si le GET / n'arrive pas assez vite.
-        log("⏳ Attente 5s -- Flask health-check Render...", "INFO")
-        time.sleep(5)
-    else:
-        log("Flask non installe -- mode standalone", "WARN")
+    # ── Structures SMC M15 ─────────────────────────────────────────────────
+    try:
+        fvg_list = detect_fvg(m15_candles)
+    except Exception:
+        fvg_list = []
 
     try:
-        log("🚀 main() démarré", "INFO")
-        main()
-    except KeyboardInterrupt:
-        print(grn(bld("\n  ✋ Bot arrête manuellement.")))
+        ob_list = detect_order_blocks(m15_candles)
+    except Exception:
+        ob_list = []
+
+    # ── Construction setup ─────────────────────────────────────────────────
+    direction:   Optional[str]   = None
+    tech_sl:     Optional[float] = None
+    tp_price:    Optional[float] = None
+    setup_type   = "—"
+    sweep_zones: List[Dict]      = []
+
+    if htf_bias == "BULLISH":
+        # Préférence OB sous le prix → FVG si pas d'OB
+        bull_obs = [ob for ob in ob_list
+                    if ob.get("type") == "BULLISH"
+                    and ob.get("high", 0) < entry_price
+                    and abs(entry_price - ob["high"]) < 2 * atr_m15]
+        bull_fvgs = [fvg for fvg in fvg_list
+                     if fvg.get("type") == "BULLISH"
+                     and fvg.get("top", 0) < entry_price
+                     and abs(entry_price - fvg["top"]) < 2 * atr_m15]
+
+        # Bonus : setup plus fort si SSL sweepée (on entre dans la liquidité)
+        ssl_swept = liq_data["swept_ssl"]
+
+        if bull_obs:
+            ob         = bull_obs[-1]
+            direction  = "LONG"
+            # SL sous le low de l'OB — si SSL sweepée, SL sous le sweep
+            sl_anchor  = min(ob["low"], min(liq_data["m15"]["ssl_zones"] or [ob["low"]]))
+            tech_sl    = sl_anchor - 0.1 * atr_m15
+            rr_mult    = 3.0 if (ssl_swept and vol_profile["institutional"]) else 2.5
+            tp_price   = entry_price + rr_mult * abs(entry_price - tech_sl)
+            setup_type = "OB Bullish" + (" + SSL Sweep" if ssl_swept else "")
+            sweep_zones.append({"low": ob["low"], "high": ob["high"]})
+        elif bull_fvgs:
+            fvg        = bull_fvgs[-1]
+            direction  = "LONG"
+            tech_sl    = fvg["bottom"] - 0.1 * atr_m15
+            rr_mult    = 2.5 if (ssl_swept and vol_profile["institutional"]) else 2.0
+            tp_price   = entry_price + rr_mult * abs(entry_price - tech_sl)
+            setup_type = "FVG Bullish" + (" + SSL Sweep" if ssl_swept else "")
+            sweep_zones.append({"low": fvg["bottom"], "high": fvg["top"]})
+
+    elif htf_bias == "BEARISH":
+        bear_obs = [ob for ob in ob_list
+                    if ob.get("type") == "BEARISH"
+                    and ob.get("low", 9e9) > entry_price
+                    and abs(ob["low"] - entry_price) < 2 * atr_m15]
+        bear_fvgs = [fvg for fvg in fvg_list
+                     if fvg.get("type") == "BEARISH"
+                     and fvg.get("bottom", 0) > entry_price
+                     and abs(fvg["bottom"] - entry_price) < 2 * atr_m15]
+
+        bsl_swept = liq_data["swept_bsl"]
+
+        if bear_obs:
+            ob         = bear_obs[-1]
+            direction  = "SHORT"
+            sl_anchor  = max(ob["high"], max(liq_data["m15"]["bsl_zones"] or [ob["high"]]))
+            tech_sl    = sl_anchor + 0.1 * atr_m15
+            rr_mult    = 3.0 if (bsl_swept and vol_profile["institutional"]) else 2.5
+            tp_price   = entry_price - rr_mult * abs(tech_sl - entry_price)
+            setup_type = "OB Bearish" + (" + BSL Sweep" if bsl_swept else "")
+            sweep_zones.append({"low": ob["low"], "high": ob["high"]})
+        elif bear_fvgs:
+            fvg        = bear_fvgs[-1]
+            direction  = "SHORT"
+            tech_sl    = fvg["top"] + 0.1 * atr_m15
+            rr_mult    = 2.5 if (bsl_swept and vol_profile["institutional"]) else 2.0
+            tp_price   = entry_price - rr_mult * abs(tech_sl - entry_price)
+            setup_type = "FVG Bearish" + (" + BSL Sweep" if bsl_swept else "")
+            sweep_zones.append({"low": fvg["bottom"], "high": fvg["top"]})
+
+    if direction is None or tech_sl is None:
+        log.debug("  %s : pas de setup valide (bias=%s)", symbol, htf_bias)
+        return None
+
+    # ── Validation volume direction ────────────────────────────────────────
+    vol_ok = volume_confirms_direction(vol_profile, direction)
+    if not vol_ok:
+        log.debug("  %s : volume ne confirme pas %s (sig=%s delta=%.2f)",
+                  symbol, direction, vol_profile["vol_signal"], vol_profile["delta_ratio"])
+        return None
+
+    # ── Upgrade 2 : Fake displacement filter ──────────────────────────────
+    fake_disp = is_fake_displacement(m15_candles, vol_profile, atr_m15, symbol)
+    if fake_disp:
+        log.info("  %s : FAKE DISPLACEMENT — large candle sans delta réel — skip", symbol)
+        return None
+
+    # ── RR brut (mid price) ────────────────────────────────────────────────
+    rr_brut = abs(tp_price - entry_price) / max(abs(tech_sl - entry_price), 1e-10)
+    if rr_brut < 1.5:
+        log.debug("  %s : RR brut trop faible (%.1f)", symbol, rr_brut)
+        return None
+
+    # ── Module M pipeline (SL expansion + qualité) ────────────────────────
+    htf_alignment = "D1_H4_ALIGNED" if htf_bias != "NEUTRAL" else "H4_ONLY"
+    m_session     = session_to_module_m(session)
+
+    # Volume quality pour Module M
+    vol_quality = "STRONG" if vol_profile["institutional"] else "NORMAL"
+    vol_regime  = "EXPANSION" if amd == "DISTRIBUTION" else "CONTRACTION"
+
+    pipeline = pipeline_sl_to_risk(
+        tech_sl           = tech_sl,
+        entry             = entry_price,
+        symbol            = symbol,
+        atr               = atr_m15,
+        balance           = ACCOUNT_BALANCE,
+        quant_verdict     = "INSTITUTIONAL" if vol_profile["institutional"] else "STANDARD",
+        risk_amount_usd   = FIXED_RISK_USD,
+        htf_alignment     = htf_alignment,
+        volume_quality    = vol_quality,
+        volatility_regime = vol_regime,
+        session           = m_session,
+        spread_pips       = spread_pips,
+        news_risk         = news_risk,
+        sweep_zones       = sweep_zones,
+    )
+
+    if pipeline["blocked"]:
+        log.debug("  %s : pipeline bloqué — %s", symbol, pipeline.get("reason"))
+        return None
+
+    sl_r = pipeline["sl_result"]
+    if not sl_r["sl_valid"]:
+        return None
+
+    effective_sl = sl_r["effective_sl"]
+
+    # ── Effective entry (ask pour LONG, bid pour SHORT) ────────────────────
+    pip         = PIP_SIZE.get(symbol, 0.0001)
+    half_spread = (spread_pips / 2) * pip
+    if direction == "LONG":
+        effective_entry = entry_price + half_spread
+    else:
+        effective_entry = entry_price - half_spread
+
+    # ══ AXE 4 : Sizing fixe 50 USD ════════════════════════════════════════
+    sizing = compute_fixed_lot(
+        symbol   = symbol,
+        entry    = effective_entry,
+        sl       = effective_sl,
+        risk_usd = FIXED_RISK_USD,
+    )
+
+    # ── RR final sur effective entry / effective SL ────────────────────────
+    sl_dist  = abs(effective_entry - effective_sl)
+    tp_dist  = abs(tp_price - effective_entry)
+    rr_final = tp_dist / max(sl_dist, 1e-10)
+
+    if rr_final < 1.5:
+        log.debug("  %s : RR effectif trop faible après Module M (%.1f)", symbol, rr_final)
+        return None
+
+    # ── Session quality score ──────────────────────────────────────────────
+    sess_score = SESSION_QUALITY.get(session, 0.5)
+
+    # ── Upgrade 1 : Trade quality score A+/A/B/REJECT ─────────────────────
+    quality = compute_trade_quality(
+        vol_profile = vol_profile,
+        liq_data    = liq_data,
+        amd         = amd,
+        rr          = rr_final,
+        session     = session,
+        regime      = regime,
+        displaced   = not fake_disp,   # False si fake displacement (déjà filtré mais pour le score)
+        map_bonus   = liq_map_quality["map_bonus"],  # FIX v4.2 : bonus niveaux matures
+    )
+    grade = quality["grade"]
+    score = quality["score"]
+
+    # Seuil minimum : on n'envoie que B et au-dessus
+    if grade == "REJECT":
+        log.info("  %s : grade REJECT (score=%.1f) — setup insuffisant", symbol, score)
+        return None
+
+    signal = {
+        "symbol":           symbol,
+        "tier":             tier,
+        "direction":        direction,
+        "entry":            entry_price,
+        "effective_entry":  effective_entry,
+        "tech_sl":          tech_sl,
+        "effective_sl":     effective_sl,
+        "tp":               tp_price,
+        "rr":               round(rr_final, 2),
+        "lot":              sizing["lot"],
+        "risk_usd":         sizing["risk_usd"],
+        "sl_pips":          sizing["sl_pips"],
+        "atr_m15":          atr_m15,
+        "spread_pips":      round(spread_pips, 1),
+        "session":          session,
+        "session_score":    sess_score,
+        "news_risk":        news_risk,
+        "htf_bias":         htf_bias,
+        "amd_phase":        amd,
+        "setup_type":       setup_type,
+        "setup_score":      score,
+        "grade":            grade,
+        "score_breakdown":  quality["breakdown"],
+        "regime":           regime,
+        "liq_map_bonus":    liq_map_quality["map_bonus"],
+        "old_bsl":          liq_map_quality["old_bsl_count"],
+        "old_ssl":          liq_map_quality["old_ssl_count"],
+        "vol_signal":       vol_profile["vol_signal"],
+        "vol_ratio":        vol_profile["vol_ratio"],
+        "delta_ratio":      vol_profile["delta_ratio"],
+        "liq_score":        liq_data["liq_score"],
+        "swept_bsl":        liq_data["swept_bsl"],
+        "swept_ssl":        liq_data["swept_ssl"],
+        "sl_quality":       sl_r["sl_quality"],
+        "sl_expansion":     sl_r["total_expansion_pips"],
+        "sl_r":             sl_r,
+        "timestamp":        datetime.datetime.utcnow(),
+    }
+
+    log.info(
+        "  ✅ SIGNAL %s %s [%s] grade=%s score=%.1f regime=%s — "
+        "E=%.5f SL=%.5f TP=%.5f RR=%.1f:1 Lot=%.2f Risk=$%.0f SLpips=%.1f Vol=%s Liq=%d",
+        symbol, direction, setup_type, grade, score, regime,
+        effective_entry, effective_sl, tp_price,
+        rr_final, sizing["lot"], sizing["risk_usd"], sizing["sl_pips"],
+        vol_profile["vol_signal"], liq_data["liq_score"],
+    )
+
+    # ── Upgrade 5 : Journalisation analytics ──────────────────────────────
+    log_trade_analytics(signal, grade=grade, score=score, regime=regime)
+
+    return signal
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TELEGRAM SENDER
+# ══════════════════════════════════════════════════════════════════════════
+
+def send_telegram(text: str) -> bool:
+    url  = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    try:
+        resp = requests.post(url, data=data, timeout=15)
+        if not resp.ok:
+            log.error("Telegram %d : %s", resp.status_code, resp.text[:200])
+            return False
+        return True
     except Exception as e:
-        log(f"ERREUR CRITIQUE: {e}", "ERROR")
-        tg_send(f"🚨 <b>AlphaBot v5.3 CRASH</b>\n{e}")
-        raise
-    finally:
-        if _flask_ok:
-            _bot_status["running"] = False
+        log.error("Telegram send failed : %s", e)
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  SIGNAL FORMATTER
+# ══════════════════════════════════════════════════════════════════════════
+
+_TIER_STARS   = {1: "⭐⭐⭐", 2: "⭐⭐", 3: "⭐"}
+_DIR_ICO      = {"LONG": "📈", "SHORT": "📉"}
+_AMD_ICO      = {"MANIPULATION": "🎭", "DISTRIBUTION": "💰",
+                 "ACCUMULATION": "🔄", "UNKNOWN": "❓"}
+_SESSION_ICO  = {
+    "LONDON_OPEN": "🇬🇧🔔", "NY_OPEN": "🇺🇸🔔",
+    "LONDON": "🇬🇧", "LONDON_NY_OVERLAP": "🌍",
+    "NEW_YORK": "🇺🇸", "ASIAN": "🌏", "OFF": "🌙",
+}
+_NEWS_LINE = {
+    "NONE":   "",
+    "MEDIUM": "\n⚠️ <b>NEWS MEDIUM</b> — spread élargi — SL protégé",
+    "HIGH":   "\n🚨 <b>NEWS HIGH</b> — SL expansé au max",
+    "NFP":    "\n🔴 <b>NFP</b> — SL ×2 ATR",
+}
+_SCORE_BAR = {
+    range(0, 5):    "▱▱▱▱▱",
+    range(5, 6):    "▰▱▱▱▱",
+    range(6, 8):    "▰▰▰▱▱",
+    range(8, 10):   "▰▰▰▰▱",
+    range(10, 15):  "▰▰▰▰▰",
+}
+
+def _score_bar(score: float) -> str:
+    s = int(score * 10)
+    for r, bar in _SCORE_BAR.items():
+        if s in r:
+            return bar
+    return "▰▰▰▰▰"
+
+
+def format_signal(sig: Dict) -> str:
+    dir_ico   = _DIR_ICO.get(sig["direction"], "")
+    sess_ico  = _SESSION_ICO.get(sig["session"], "")
+    amd_ico   = _AMD_ICO.get(sig["amd_phase"], "")
+    stars     = _TIER_STARS.get(sig["tier"], "")
+    news_txt  = _NEWS_LINE.get(sig["news_risk"], "")
+    sl_block  = fmt_sl_block(sig["sl_r"])
+
+    # ── Grade badge ────────────────────────────────────────────────────────
+    grade_ico = {"A+": "🏆", "A": "🥇", "B": "🥈"}.get(sig["grade"], "")
+    grade_bar = {
+        "A+": "▰▰▰▰▰", "A": "▰▰▰▰▱", "B": "▰▰▰▱▱"
+    }.get(sig["grade"], "▰▰▱▱▱")
+
+    # ── Régime ────────────────────────────────────────────────────────────
+    regime_ico = {"EXPANSION": "🚀", "TRENDING": "📊", "RANGING": "↔️"}.get(sig["regime"], "")
+
+    # ── Volume line ────────────────────────────────────────────────────────
+    vol_ico = {
+        "STRONG_BUY":  "🟢", "STRONG_SELL": "🔴",
+        "ABSORPTION":  "🔵", "EXHAUSTION":  "🟠", "NEUTRAL": "⚪",
+    }.get(sig["vol_signal"], "⚪")
+    vol_line = (
+        f"{vol_ico} Vol: <b>{sig['vol_signal']}</b>  "
+        f"×{sig['vol_ratio']:.1f}  |  Δ {sig['delta_ratio']:.0%}"
+    )
+
+    # ── Liquidité line ─────────────────────────────────────────────────────
+    liq_parts = []
+    if sig["swept_bsl"]:
+        liq_parts.append("BSL✓")
+    if sig["swept_ssl"]:
+        liq_parts.append("SSL✓")
+    liq_str  = " + ".join(liq_parts) if liq_parts else "—"
+    map_line = ""
+    if sig.get("old_bsl", 0) + sig.get("old_ssl", 0) > 0:
+        map_line = f"  🗺 Map: {sig['old_bsl']}BSL/{sig['old_ssl']}SSL mature"
+    liq_line = f"💧 Liq: <b>{liq_str}</b>  score {sig['liq_score']}/3{map_line}"
+
+    return (
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"{dir_ico} <b>ALPHABOT PRO</b> — <code>{sig['symbol']}</code>  {stars}\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        f"{grade_ico} <b>Grade {sig['grade']}</b>  {grade_bar}  "
+        f"<i>score {sig['setup_score']:.1f}/10</i>\n"
+        f"{dir_ico} <b>{sig['direction']}</b>   {amd_ico} <i>{sig['amd_phase']}</i>   "
+        f"{regime_ico} <i>{sig['regime']}</i>\n"
+        f"📋 Setup : <b>{sig['setup_type']}</b>\n"
+        f"🔭 Bias H4 : <b>{sig['htf_bias']}</b>\n"
+        f"{sess_ico} Session : <b>{sig['session']}</b>\n\n"
+        f"{vol_line}\n"
+        f"{liq_line}\n\n"
+        f"🎯 <b>ENTRY</b>   : <code>{sig['effective_entry']:.5f}</code>\n"
+        f"🛑 <b>STOP</b>    : <code>{sig['effective_sl']:.5f}</code>  "
+        f"({sig['sl_pips']:.0f}p)  <i>({sig['sl_quality']} +{sig['sl_expansion']:.0f}p)</i>\n"
+        f"✅ <b>TARGET</b>  : <code>{sig['tp']:.5f}</code>\n"
+        f"📐 <b>RR</b>      : <b>{sig['rr']:.1f}:1</b>  "
+        f"(spread: {sig['spread_pips']:.1f}p)\n\n"
+        f"💼 Lot : <b>{sig['lot']}</b>  |  Risque : <b>${sig['risk_usd']:.0f}</b>\n"
+        f"{sl_block}"
+        f"{news_txt}\n\n"
+        f"<i>AlphaBot PRO v4.0 · {sig['timestamp'].strftime('%H:%M UTC')}</i>"
+    )
+
+
+def send_startup_message():
+    msg = (
+        "🟢 <b>ALPHABOT PRO v4.0 — DÉMARRAGE</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"💰 Balance : <b>${ACCOUNT_BALANCE:,.0f}</b>\n"
+        f"🎯 Risque fixe : <b>${FIXED_RISK_USD:.0f} / trade</b>\n"
+        f"📊 Symboles : <b>{len(ALL_SYMBOLS)}</b>  "
+        f"(T1: {len(TIER_1)} | T2: {len(TIER_2)} | T3: {len(TIER_3)})\n"
+        f"🔁 Scan : <b>{SCAN_INTERVAL_SEC // 60} min</b>\n"
+        f"📈 Cap signaux/jour : <b>{MAX_SIGNALS_PER_DAY}</b>\n"
+        f"⏸ Cooldown symbole : <b>{SYMBOL_COOLDOWN_H}h</b>\n"
+        f"🔗 Corr. cap : <b>{MAX_CORR_EXPOSURE} positions/groupe</b>\n"
+        "🔬 Volume : relatif + delta proxy + fake disp.\n"
+        "💧 Liquidité : BSL/SSL M15+H4 + map persistante\n"
+        "🎭 AMD : sweep + BOS + volume\n"
+        "🏆 Score : A+/A/B/REJECT sur 10pts\n"
+        "📈 Régime : EXPANSION/TRENDING/RANGING\n"
+        "📝 Analytics : alphabot_analytics.jsonl\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    send_telegram(msg)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  BOUCLE PRINCIPALE — WATCHDOG INTÉGRÉ
+# ══════════════════════════════════════════════════════════════════════════
+
+async def scan_once(
+    tracker:   SignalTracker,
+    corr_guard: CorrelationGuard,
+) -> None:
+    """Un cycle complet de scan sur tous les symboles."""
+    session   = get_current_session()
+    news_risk = get_news_risk()
+
+    log.info(
+        "=== SCAN — Session: %s | News: %s | Signaux: %d/%d",
+        session, news_risk, tracker.count_today, MAX_SIGNALS_PER_DAY,
+    )
+
+    for tier, symbols in [(1, TIER_1), (2, TIER_2), (3, TIER_3)]:
+        for symbol in symbols:
+
+            # ── Pre-checks globaux ─────────────────────────────────────────
+            # Vérifié avant le pipeline pour ne pas fetch si inutile
+            can_global, _ = tracker.can_send(symbol, "placeholder_preflight")
+            if not can_global:
+                continue
+
+            try:
+                htf_bias = get_htf_bias(symbol)
+
+                signal = run_signal_pipeline(
+                    symbol    = symbol,
+                    session   = session,
+                    news_risk = news_risk,
+                    htf_bias  = htf_bias,
+                    tier      = tier,
+                )
+
+                if not signal:
+                    await asyncio.sleep(1)
+                    continue
+
+                # ── Setup hash ────────────────────────────────────────────
+                sh = tracker.make_setup_hash(
+                    symbol    = symbol,
+                    direction = signal["direction"],
+                    entry     = signal["effective_entry"],
+                    sl        = signal["effective_sl"],
+                    tp        = signal["tp"],
+                )
+
+                # ── Vérification tracker (avec vrai hash) ─────────────────
+                can, reason = tracker.can_send(symbol, sh)
+                if not can:
+                    log.info("  %s : signal non envoyé — %s", symbol, reason)
+                    await asyncio.sleep(1)
+                    continue
+
+                # ── Correlation guard ─────────────────────────────────────
+                corr_ok, corr_reason = corr_guard.can_add(symbol, signal["direction"])
+                if not corr_ok:
+                    log.info("  %s : bloqué corrélation — %s", symbol, corr_reason)
+                    await asyncio.sleep(1)
+                    continue
+
+                # ── Envoi Telegram ────────────────────────────────────────
+                msg = format_signal(signal)
+                ok  = send_telegram(msg)
+
+                if ok:
+                    tracker.record(symbol, sh)
+                    corr_guard.register(symbol)
+                else:
+                    log.error("  %s : échec envoi Telegram", symbol)
+
+            except Exception as e:
+                log.error("  Pipeline %s : %s", symbol, e, exc_info=True)
+
+            await asyncio.sleep(2)   # politesse API
+
+
+async def scan_loop():
+    """Boucle infinie avec watchdog — ne crashe jamais silencieusement."""
+    tracker    = SignalTracker()
+    corr_guard = CorrelationGuard()
+
+    send_startup_message()
+    _load_liq_map()
+    log.info("AlphaBot PRO v4.0 démarré — cycle %ds", SCAN_INTERVAL_SEC)
+
+    while True:
+        cycle_start = time.time()
+
+        try:
+            await scan_once(tracker, corr_guard)
+        except Exception as e:
+            # Watchdog : log l'erreur, attend 30s, reprend
+            log.critical("WATCHDOG — erreur cycle : %s", e, exc_info=True)
+            send_telegram(f"⚠️ <b>AlphaBot PRO — Erreur cycle</b>\n<code>{str(e)[:200]}</code>")
+            await asyncio.sleep(30)
+            continue
+
+        elapsed = time.time() - cycle_start
+        wait    = max(0, SCAN_INTERVAL_SEC - elapsed)
+        log.info("Cycle terminé en %.1fs — prochain scan dans %.0fs", elapsed, wait)
+        await asyncio.sleep(wait)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    asyncio.run(scan_loop())
+
